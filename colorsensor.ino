@@ -13,7 +13,6 @@
 #include <MFRC522.h>
 #include <Wire.h>
 #include <Adafruit_TCS34725.h>
-#include <ArduinoJson.h>
 #include <Secrets.h>
 #include "html.h"
 
@@ -46,68 +45,28 @@
 #define COLOR_SCL  6
 
 // ── Detection tuning ───────────────────────────────────────────────────────────
-// Deviation is measured on normalised 0-255 channels, not raw counts.
-// THRESH: minimum normalised deviation to consider a ball present (tune 5-20).
-// SETTLE: ms of stable baseline before an event is committed.
-#define DETECT_THRESH   10
-#define SETTLE_MS       100
-#define EMA_ALPHA       0.04f
+#define DETECT_THRESH   10    // normalised deviation to trigger event (tune 5-20)
+#define SETTLE_MS       100   // ms at baseline before committing
+#define EMA_ALPHA       0.04f // baseline drift rate
 
-// ── Training ───────────────────────────────────────────────────────────────────
+// ── Training constants ──────────────────────────────────────────────────────────
 #define MAX_PROFILES    16
 #define NAME_LEN        20
 
+// ── Structs ───────────────────────────────────────────────────────────────────
 struct ColorProfile {
-  char     name[NAME_LEN];
-  uint8_t  r, g, b;      // normalised 0-255 training values
-  bool     used = false;
+  char    name[NAME_LEN];
+  uint8_t r, g, b;   // normalised 0-255
+  bool    used = false;
 };
 
-ColorProfile profiles[MAX_PROFILES];
-uint8_t      numProfiles = 0;
+struct CalData {
+  uint16_t dR, dG, dB;
+  uint16_t wR, wG, wB;
+  bool valid = false;
+};
 
-void loadProfiles() {
-  prefs.begin("profiles", true);
-  numProfiles = prefs.getUChar("count", 0);
-  for (uint8_t i = 0; i < numProfiles && i < MAX_PROFILES; i++) {
-    String key = "p" + String(i);
-    prefs.getBytes(key.c_str(), &profiles[i], sizeof(ColorProfile));
-    profiles[i].used = true;
-  }
-  prefs.end();
-  DBG("Loaded profiles: "); DBGLN(numProfiles);
-}
-
-void saveProfiles() {
-  prefs.begin("profiles", false);
-  prefs.putUChar("count", numProfiles);
-  for (uint8_t i = 0; i < numProfiles; i++) {
-    String key = "p" + String(i);
-    prefs.putBytes(key.c_str(), &profiles[i], sizeof(ColorProfile));
-  }
-  prefs.end();
-}
-
-// Euclidean distance in normalised RGB space
-float profileDist(const ColorProfile &p, uint8_t r, uint8_t g, uint8_t b) {
-  float dr = (float)p.r - r;
-  float dg = (float)p.g - g;
-  float db = (float)p.b - b;
-  return sqrtf(dr*dr + dg*dg + db*db);
-}
-
-// Returns index of nearest profile, or -1 if no profiles or dist > maxDist
-int matchProfile(uint8_t r, uint8_t g, uint8_t b, float maxDist = 60.0f) {
-  int   best  = -1;
-  float bestD = maxDist;
-  for (uint8_t i = 0; i < numProfiles; i++) {
-    float d = profileDist(profiles[i], r, g, b);
-    if (d < bestD) { bestD = d; best = i; }
-  }
-  return best;
-}
-
-// ── Objects ───────────────────────────────────────────────────────────────────
+// ── All globals (declared before any function that uses them) ───────────────────
 Preferences       prefs;
 WebServer         server(80);
 DNSServer         dns;
@@ -118,35 +77,26 @@ bool   apMode = false;
 bool   tcsOK  = false;
 String lastUID = "None";
 
-// Live raw sensor readings (always current)
-uint16_t liveR = 0, liveG = 0, liveB = 0, liveC = 0;
+uint16_t liveR = 0, liveG = 0, liveB = 0, liveC = 0;  // raw sensor readings
+uint8_t  normR = 0, normG = 0, normB = 0;               // normalised 0-255
 
-// Normalised live values (0-255)
-uint8_t  normR = 0, normG = 0, normB = 0;
+uint8_t detR = 128, detG = 128, detB = 128;             // last committed result
+String  detName  = "—";
+float   detDist  = 0;
+bool    detMatch = false;
 
-// Last committed detection result
-uint8_t  detR = 128, detG = 128, detB = 128;
-String   detName   = "—";
-float    detDist   = 0;
-bool     detMatch  = false;
+float   baseR = 128, baseG = 128, baseB = 128;          // EMA baseline (norm)
 
-// ── EMA baseline (normalised space) ─────────────────────────────────────────────
-float baseR = 128, baseG = 128, baseB = 128;
-
-// ── Event state ─────────────────────────────────────────────────────────────────
-bool     inEvent       = false;
-uint32_t settleStart   = 0;
+bool     inEvent     = false;
+uint32_t settleStart = 0;
 uint8_t  peakR = 0, peakG = 0, peakB = 0;
-float    peakDev       = 0;
+float    peakDev     = 0;
 
-// ── White calibration ──────────────────────────────────────────────────────────
-struct CalData {
-  uint16_t dR, dG, dB;
-  uint16_t wR, wG, wB;
-  bool valid = false;
-};
-CalData cal;
+CalData      cal;
+ColorProfile profiles[MAX_PROFILES];
+uint8_t      numProfiles = 0;
 
+// ── Calibration helpers ──────────────────────────────────────────────────────────
 void loadCal() {
   prefs.begin("cal", true);
   cal.dR    = prefs.getUShort("dR", 0);
@@ -183,6 +133,46 @@ void updateNorm() {
     normG = (uint8_t)min(255UL, (uint32_t)liveG * 255UL / s);
     normB = (uint8_t)min(255UL, (uint32_t)liveB * 255UL / s);
   }
+}
+
+// ── Profile helpers ──────────────────────────────────────────────────────────────
+void loadProfiles() {
+  prefs.begin("profiles", true);
+  numProfiles = prefs.getUChar("count", 0);
+  for (uint8_t i = 0; i < numProfiles && i < MAX_PROFILES; i++) {
+    String key = "p" + String(i);
+    prefs.getBytes(key.c_str(), &profiles[i], sizeof(ColorProfile));
+    profiles[i].used = true;
+  }
+  prefs.end();
+  DBG("Loaded profiles: "); DBGLN(numProfiles);
+}
+
+void saveProfiles() {
+  prefs.begin("profiles", false);
+  prefs.putUChar("count", numProfiles);
+  for (uint8_t i = 0; i < numProfiles; i++) {
+    String key = "p" + String(i);
+    prefs.putBytes(key.c_str(), &profiles[i], sizeof(ColorProfile));
+  }
+  prefs.end();
+}
+
+float profileDist(const ColorProfile &p, uint8_t r, uint8_t g, uint8_t b) {
+  float dr = (float)p.r - r;
+  float dg = (float)p.g - g;
+  float db = (float)p.b - b;
+  return sqrtf(dr*dr + dg*dg + db*db);
+}
+
+int matchProfile(uint8_t r, uint8_t g, uint8_t b, float maxDist = 60.0f) {
+  int   best  = -1;
+  float bestD = maxDist;
+  for (uint8_t i = 0; i < numProfiles; i++) {
+    float d = profileDist(profiles[i], r, g, b);
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  return best;
 }
 
 // ── WiFi ───────────────────────────────────────────────────────────────────────
@@ -224,7 +214,6 @@ void handleRoot() {
   server.send_P(200, "text/html", apMode ? WIFI_HTML : INDEX_HTML);
 }
 
-// Last committed detection result
 void handleData() {
   char hex[8];
   snprintf(hex, sizeof(hex), "#%02X%02X%02X", detR, detG, detB);
@@ -239,7 +228,6 @@ void handleData() {
   server.send(200, "application/json", j);
 }
 
-// Live normalised + raw values
 void handleLiveData() {
   float dR = fabsf((float)normR - baseR);
   float dG = fabsf((float)normG - baseG);
@@ -260,7 +248,6 @@ void handleLiveData() {
   server.send(200, "application/json", j);
 }
 
-// List all training profiles as JSON array
 void handleProfilesList() {
   String j = "[";
   for (uint8_t i = 0; i < numProfiles; i++) {
@@ -278,7 +265,6 @@ void handleProfilesList() {
   server.send(200, "application/json", j);
 }
 
-// Save current live normalised reading as a new named profile
 void handleProfileTrain() {
   if (!server.hasArg("name") || server.arg("name").length() == 0) {
     server.send(400, "application/json", "{\"error\":\"Missing name\"}");
@@ -300,16 +286,14 @@ void handleProfileTrain() {
   char hex[8];
   snprintf(hex, sizeof(hex), "#%02X%02X%02X", p.r, p.g, p.b);
   DBG("Trained "); DBG(p.name); DBG(" R="); DBG(p.r); DBG(" G="); DBG(p.g); DBG(" B="); DBGLN(p.b);
-  String j = "{\"ok\":true,\"name\":\"" + String(p.name) + "\",\"hex\":\"" + hex + "\"}";
-  server.send(200, "application/json", j);
+  server.send(200, "application/json",
+    "{\"ok\":true,\"name\":\"" + String(p.name) + "\",\"hex\":\"" + hex + "\"}");
 }
 
-// Delete a profile by index
 void handleProfileDelete() {
   if (!server.hasArg("i")) { server.send(400, "application/json", "{\"error\":\"Missing i\"}"); return; }
-  uint8_t idx = server.arg("i").toInt();
+  uint8_t idx = (uint8_t)server.arg("i").toInt();
   if (idx >= numProfiles) { server.send(400, "application/json", "{\"error\":\"Bad index\"}"); return; }
-  // Shift remaining profiles down
   for (uint8_t i = idx; i < numProfiles - 1; i++) profiles[i] = profiles[i + 1];
   numProfiles--;
   saveProfiles();
@@ -353,16 +337,16 @@ void handleCalReset() {
 }
 
 void setupServer() {
-  server.on("/",               HTTP_GET,  handleRoot);
-  server.on("/data",           HTTP_GET,  handleData);
-  server.on("/livedata",       HTTP_GET,  handleLiveData);
-  server.on("/profiles",       HTTP_GET,  handleProfilesList);
-  server.on("/profiles/train", HTTP_POST, handleProfileTrain);
-  server.on("/profiles/delete",HTTP_POST, handleProfileDelete);
-  server.on("/setwifi",        HTTP_POST, handleSetWifi);
-  server.on("/cal/black",      HTTP_POST, handleCalBlack);
-  server.on("/cal/white",      HTTP_POST, handleCalWhite);
-  server.on("/cal/reset",      HTTP_POST, handleCalReset);
+  server.on("/",                HTTP_GET,  handleRoot);
+  server.on("/data",            HTTP_GET,  handleData);
+  server.on("/livedata",        HTTP_GET,  handleLiveData);
+  server.on("/profiles",        HTTP_GET,  handleProfilesList);
+  server.on("/profiles/train",  HTTP_POST, handleProfileTrain);
+  server.on("/profiles/delete", HTTP_POST, handleProfileDelete);
+  server.on("/setwifi",         HTTP_POST, handleSetWifi);
+  server.on("/cal/black",       HTTP_POST, handleCalBlack);
+  server.on("/cal/white",       HTTP_POST, handleCalWhite);
+  server.on("/cal/reset",       HTTP_POST, handleCalReset);
   server.onNotFound([]() {
     server.sendHeader("Location",
       String("http://") + (apMode ? WiFi.softAPIP().toString()
@@ -404,8 +388,7 @@ void setup() {
   loadCal();
   loadProfiles();
   if (cal.valid) {
-    // Seed baseline at normalised white
-    baseR = 255; baseG = 255; baseB = 255;
+    baseR = 255; baseG = 255; baseB = 255;  // seed baseline at normalised white
   }
   DBGLN(tcsOK ? "TCS3472 ready (2.4ms/16x)" : "TCS3472 NOT found — check wiring");
 }
@@ -458,7 +441,7 @@ void loop() {
     if (tcsOK && millis() - lastPoll >= 3) {
       lastPoll = millis();
       tcs.getRawData(&liveR, &liveG, &liveB, &liveC);
-      updateNorm();  // always recompute normalised values
+      updateNorm();
 
       float dR = fabsf((float)normR - baseR);
       float dG = fabsf((float)normG - baseG);
@@ -467,19 +450,17 @@ void loop() {
 
       if (!inEvent) {
         if (maxDev > DETECT_THRESH) {
-          inEvent    = true;
-          peakDev    = maxDev;
+          inEvent     = true;
+          peakDev     = maxDev;
           peakR = normR; peakG = normG; peakB = normB;
           settleStart = 0;
           DBG("Event start dev="); DBGLN(maxDev);
         } else {
-          // Adapt baseline slowly when idle
           baseR += EMA_ALPHA * ((float)normR - baseR);
           baseG += EMA_ALPHA * ((float)normG - baseG);
           baseB += EMA_ALPHA * ((float)normB - baseB);
         }
       } else {
-        // Track sample with greatest deviation during the event
         if (maxDev > peakDev) {
           peakDev = maxDev;
           peakR = normR; peakG = normG; peakB = normB;
@@ -487,7 +468,6 @@ void loop() {
         if (maxDev <= DETECT_THRESH) {
           if (settleStart == 0) settleStart = millis();
           if (millis() - settleStart >= SETTLE_MS) {
-            // Commit: classify peak against trained profiles
             detR = peakR; detG = peakG; detB = peakB;
             int match = matchProfile(peakR, peakG, peakB);
             if (match >= 0) {
@@ -499,7 +479,7 @@ void loop() {
               detName  = "Unknown";
               detDist  = 0;
               detMatch = false;
-              DBG("No match for R="); DBG(peakR); DBG(" G="); DBG(peakG); DBG(" B="); DBGLN(peakB);
+              DBG("No match R="); DBG(peakR); DBG(" G="); DBG(peakG); DBG(" B="); DBGLN(peakB);
             }
             inEvent     = false;
             settleStart = 0;
