@@ -230,6 +230,11 @@ void setup() {
   // SPI → MFRC522
   SPI.begin(RFID_SCK, RFID_MISO, RFID_MOSI, RFID_SS);
   rfid.PCD_Init();
+  rfid.PCD_SetAntennaGain(rfid.RxGain_max);  // 48 dB max receiver gain
+  #if DEBUG
+    DBG("RFID gain register: 0x");
+    DBGLN(String(rfid.PCD_ReadRegister(rfid.RFCfgReg), HEX));
+  #endif
   DBGLN("RFID ready");
 
   // I2C → TCS3472
@@ -259,18 +264,40 @@ void loop() {
   else         ArduinoOTA.handle();
   server.handleClient();
 
-  // ── RFID scan ────────────────────────────────────────────────────────────────
-  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-    lastUID = "";
-    for (byte i = 0; i < rfid.uid.size; i++) {
-      if (i) lastUID += ':';
-      if (rfid.uid.uidByte[i] < 0x10) lastUID += '0';
-      lastUID += String(rfid.uid.uidByte[i], HEX);
+  // ── RFID fast scan ───────────────────────────────────────────────────────────
+  // Use WUPA (wakes ALL tags including halted) and don't halt between reads
+  // for minimum latency on fast pass-by tags
+  static bool tagWasPresent = false;
+
+  byte bufferATQA[2];
+  byte bufferSize = sizeof(bufferATQA);
+  // WUPA: faster than REQA for re-detecting, wakes halted tags too
+  MFRC522::StatusCode wakeStatus = rfid.PICC_WakeupA(bufferATQA, &bufferSize);
+
+  if (wakeStatus == MFRC522::STATUS_OK) {
+    // Tag is in the field — now read its UID
+    if (rfid.PICC_ReadCardSerial()) {
+      String uid = "";
+      for (byte i = 0; i < rfid.uid.size; i++) {
+        if (i) uid += ':';
+        if (rfid.uid.uidByte[i] < 0x10) uid += '0';
+        uid += String(rfid.uid.uidByte[i], HEX);
+      }
+      uid.toUpperCase();
+      if (uid != lastUID) {   // only log on change
+        lastUID = uid;
+        DBG("RFID: "); DBGLN(lastUID);
+      }
+      tagWasPresent = true;
+      // NOTE: intentionally NOT calling PICC_HaltA() here —
+      // tag stays ACTIVE so next WUPA cycle is faster
+      rfid.PCD_StopCrypto1();
     }
-    lastUID.toUpperCase();
-    DBG("RFID: "); DBGLN(lastUID);
-    rfid.PICC_HaltA();
-    rfid.PCD_StopCrypto1();
+  } else {
+    if (tagWasPresent) {
+      tagWasPresent = false;
+      DBGLN("RFID: tag left field");
+    }
   }
 
   // ── Color sensor (throttled) ─────────────────────────────────────────────────
