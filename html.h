@@ -12,13 +12,17 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   h1{font-size:1.3em;color:#aaa;margin-bottom:20px}
   .card{background:#1e1e1e;border-radius:10px;padding:16px;margin:12px 0}
   .swatch{height:80px;border-radius:8px;border:1px solid #333;margin-bottom:14px;transition:background .4s}
+  .swlive{height:40px;border-radius:6px;border:1px solid #333;margin-bottom:10px;transition:background .15s}
   table{width:100%;border-collapse:collapse}
-  td{padding:5px 2px;font-size:.95em}
+  td{padding:4px 2px;font-size:.9em}
   td:last-child{text-align:right;font-weight:600;font-family:monospace}
   .uid{font-family:monospace;font-size:1.15em;letter-spacing:2px;word-break:break-all;margin-top:6px}
   .lbl{color:#888;font-size:.8em}
+  .sublbl{color:#666;font-size:.75em;margin-bottom:4px}
   .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#555;margin-right:6px}
   .dot.ok{background:#4caf50}
+  .evdot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#555;margin-right:4px;vertical-align:middle}
+  .evdot.active{background:#ff9800;box-shadow:0 0 6px #ff9800}
   .calbtn{flex:1;padding:9px;background:#2a2a2a;color:#eee;border:1px solid #555;border-radius:5px;cursor:pointer;font-size:.85em;line-height:1.4}
   .calbtn:hover{background:#383838}
   .calbtn.rst{color:#888;border-color:#444}
@@ -26,22 +30,40 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </head><body>
 <h1>🎨 Color Sensor Node</h1>
 
+<!-- Committed color (last peak event) -->
 <div class="card">
+  <div class="lbl">Last Detected Color &nbsp;<span class="evdot" id="evdot"></span><span id="evlbl" style="font-size:.75em;color:#666">idle</span></div>
   <div class="swatch" id="sw"></div>
   <table>
-    <tr><td>Red (raw)</td>  <td id="r">—</td></tr>
-    <tr><td>Green (raw)</td><td id="g">—</td></tr>
-    <tr><td>Blue (raw)</td> <td id="b">—</td></tr>
-    <tr><td>Clear</td>      <td id="c">—</td></tr>
-    <tr><td>Hex</td>        <td id="hex">—</td></tr>
+    <tr><td>R</td><td id="r">—</td></tr>
+    <tr><td>G</td><td id="g">—</td></tr>
+    <tr><td>B</td><td id="b">—</td></tr>
+    <tr><td>Clear</td><td id="c">—</td></tr>
+    <tr><td>Hex</td><td id="hex">—</td></tr>
   </table>
 </div>
 
+<!-- Live raw readout -->
+<div class="card">
+  <div class="lbl">Live Raw</div>
+  <div class="swlive" id="swlive"></div>
+  <table>
+    <tr><td>R</td><td id="lr">—</td></tr>
+    <tr><td>G</td><td id="lg">—</td></tr>
+    <tr><td>B</td><td id="lb">—</td></tr>
+    <tr><td>Clear</td><td id="lc">—</td></tr>
+    <tr><td>Deviation</td><td id="dev">—</td></tr>
+    <tr><td style="color:#555">Baseline R/G/B</td><td id="base" style="color:#555;font-size:.8em">—</td></tr>
+  </table>
+</div>
+
+<!-- RFID -->
 <div class="card">
   <div class="lbl">RFID — Last Tag UID</div>
   <div class="uid" id="uid">—</div>
 </div>
 
+<!-- Calibration -->
 <div class="card">
   <div class="lbl">Calibration &nbsp;<span id="calst" style="color:#f44336">uncalibrated</span></div>
   <div style="display:flex;gap:8px;margin-top:10px">
@@ -57,6 +79,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 </div>
 
 <script>
+function toHex(r,g,b,max){
+  if(!max||max===0) return '#000000';
+  var R=Math.min(255,Math.round(r*255/max));
+  var G=Math.min(255,Math.round(g*255/max));
+  var B=Math.min(255,Math.round(b*255/max));
+  return '#'+[R,G,B].map(v=>v.toString(16).padStart(2,'0')).join('');
+}
+
 function update(){
   fetch('/data').then(r=>r.json()).then(d=>{
     document.getElementById('r').textContent   = d.r;
@@ -70,8 +100,25 @@ function update(){
     document.getElementById('ts').textContent  = new Date().toLocaleTimeString();
     var cs = document.getElementById('calst');
     if(d.calOK){ cs.textContent='✓ calibrated'; cs.style.color='#4caf50'; }
-    else        { cs.textContent='uncalibrated'; cs.style.color='#f44336'; }
+    else        { cs.textContent='uncalibrated';  cs.style.color='#f44336'; }
+    var ev = document.getElementById('evdot');
+    var evlbl = document.getElementById('evlbl');
+    if(d.event){ ev.className='evdot active'; evlbl.textContent='scanning…'; }
+    else       { ev.className='evdot';         evlbl.textContent='idle'; }
   }).catch(()=>{ document.getElementById('dot').className='dot'; });
+}
+
+function updateLive(){
+  fetch('/livedata').then(r=>r.json()).then(d=>{
+    document.getElementById('lr').textContent  = d.lr;
+    document.getElementById('lg').textContent  = d.lg;
+    document.getElementById('lb').textContent  = d.lb;
+    document.getElementById('lc').textContent  = d.lc;
+    document.getElementById('dev').textContent = d.dev;
+    document.getElementById('base').textContent= d.bR+' / '+d.bG+' / '+d.bB;
+    var max = Math.max(d.lr, d.lg, d.lb, 1);
+    document.getElementById('swlive').style.background = toHex(d.lr, d.lg, d.lb, max);
+  }).catch(()=>{});
 }
 
 function doCalStep(type){
@@ -85,7 +132,8 @@ function doCalStep(type){
 }
 
 update();
-setInterval(update, 1000);
+setInterval(update, 1000);      // committed color + cal status
+setInterval(updateLive, 250);   // live raw strip updates 4x/sec
 </script>
 </body></html>
 )rawliteral";

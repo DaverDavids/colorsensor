@@ -45,7 +45,8 @@
 #define COLOR_SCL  6
 
 // ── Color event detection tuning ─────────────────────────────────────────────
-#define COLOR_DEVIATION_THRESH  80    // raw counts out of 1024 max at 2.4ms
+// At 2.4ms + 16x gain: max ~4096 counts. Tune THRESH to ~5-10% of your white baseline.
+#define COLOR_DEVIATION_THRESH  30    // raw counts — lower = more sensitive
 #define COLOR_SETTLE_MS         80    // ms back at baseline before committing event
 #define EMA_ALPHA               0.05f // baseline drift rate
 
@@ -54,15 +55,20 @@ Preferences       prefs;
 WebServer         server(80);
 DNSServer         dns;
 MFRC522           rfid(RFID_SS, RFID_RST);
-// 2.4ms integration + 1x gain: ~400Hz, max 1024 counts — ideal for LED-lit fast pass-by
-Adafruit_TCS34725 tcs(TCS34725_INTEGRATIONTIME_2_4MS, TCS34725_GAIN_1X);
+// 2.4ms integration + 16x gain: fast sampling with enough sensitivity for typical LEDs
+// If still saturating (counts near 4096) drop to TCS34725_GAIN_4X
+// If still too low, increase to TCS34725_GAIN_60X
+Adafruit_TCS34725 tcs(TCS34725_INTEGRATIONTIME_2_4MS, TCS34725_GAIN_16X);
 
 bool     apMode  = false;
 bool     tcsOK   = false;
 String   lastUID = "None";
 
-// Live sensor values — always updated every poll, used by web UI and calibration captures
+// Live sensor values — always updated every poll
 uint16_t cR = 0, cG = 0, cB = 0, cC = 0;
+
+// Live raw values (never overwritten by event commit, always current)
+uint16_t liveR = 0, liveG = 0, liveB = 0, liveC = 0;
 
 // ── Baseline + event state ────────────────────────────────────────────────────
 float    baseR = 512, baseG = 512, baseB = 512;
@@ -84,9 +90,9 @@ void loadCal() {
   cal.dR    = prefs.getUShort("dR", 0);
   cal.dG    = prefs.getUShort("dG", 0);
   cal.dB    = prefs.getUShort("dB", 0);
-  cal.wR    = prefs.getUShort("wR", 1023);
-  cal.wG    = prefs.getUShort("wG", 1023);
-  cal.wB    = prefs.getUShort("wB", 1023);
+  cal.wR    = prefs.getUShort("wR", 4095);
+  cal.wG    = prefs.getUShort("wG", 4095);
+  cal.wB    = prefs.getUShort("wB", 4095);
   cal.valid = prefs.getBool("calOK", false);
   prefs.end();
 }
@@ -143,6 +149,7 @@ void handleRoot() {
   server.send_P(200, "text/html", apMode ? WIFI_HTML : INDEX_HTML);
 }
 
+// Committed color — last peak from a color event (shown as swatch)
 void handleData() {
   uint8_t R, G, B;
   if (cal.valid) {
@@ -165,6 +172,23 @@ void handleData() {
   server.send(200, "application/json", j);
 }
 
+// Live raw values — always current, used by the live readout strip
+void handleLiveData() {
+  float dev = max(fabsf((float)liveR - baseR),
+             max(fabsf((float)liveG - baseG),
+                 fabsf((float)liveB - baseB)));
+  String j = "{\"lr\":" + String(liveR) +
+             ",\"lg\":" + String(liveG) +
+             ",\"lb\":" + String(liveB) +
+             ",\"lc\":" + String(liveC) +
+             ",\"dev\":" + String((int)dev) +
+             ",\"bR\":"  + String((int)baseR) +
+             ",\"bG\":"  + String((int)baseG) +
+             ",\"bB\":"  + String((int)baseB) +
+             ",\"event\":" + (inColorEvent ? "true" : "false") + "}";
+  server.send(200, "application/json", j);
+}
+
 void handleSetWifi() {
   if (!server.hasArg("ssid")) { server.send(400, "text/plain", "Missing ssid"); return; }
   prefs.begin("wifi", false);
@@ -179,36 +203,36 @@ void handleSetWifi() {
 }
 
 void handleCalBlack() {
-  // cR/cG/cB are always live, safe to capture directly
-  cal.dR = cR; cal.dG = cG; cal.dB = cB;
+  cal.dR = liveR; cal.dG = liveG; cal.dB = liveB;
   saveCal();
   DBG("Cal black: R="); DBG(cal.dR); DBG(" G="); DBG(cal.dG); DBG(" B="); DBGLN(cal.dB);
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleCalWhite() {
-  // cR/cG/cB are always live, safe to capture directly
-  cal.wR = cR; cal.wG = cG; cal.wB = cB;
+  cal.wR = liveR; cal.wG = liveG; cal.wB = liveB;
   cal.valid = true;
   saveCal();
   baseR = cal.wR; baseG = cal.wG; baseB = cal.wB;
+  cR = liveR; cG = liveG; cB = liveB; cC = liveC;
   DBG("Cal white: R="); DBG(cal.wR); DBG(" G="); DBG(cal.wG); DBG(" B="); DBGLN(cal.wB);
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleCalReset() {
   prefs.begin("cal", false); prefs.clear(); prefs.end();
-  cal = {0, 0, 0, 1023, 1023, 1023, false};
+  cal = {0, 0, 0, 4095, 4095, 4095, false};
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void setupServer() {
-  server.on("/",          HTTP_GET,  handleRoot);
-  server.on("/data",      HTTP_GET,  handleData);
-  server.on("/setwifi",   HTTP_POST, handleSetWifi);
-  server.on("/cal/black", HTTP_POST, handleCalBlack);
-  server.on("/cal/white", HTTP_POST, handleCalWhite);
-  server.on("/cal/reset", HTTP_POST, handleCalReset);
+  server.on("/",           HTTP_GET,  handleRoot);
+  server.on("/data",       HTTP_GET,  handleData);
+  server.on("/livedata",   HTTP_GET,  handleLiveData);
+  server.on("/setwifi",    HTTP_POST, handleSetWifi);
+  server.on("/cal/black",  HTTP_POST, handleCalBlack);
+  server.on("/cal/white",  HTTP_POST, handleCalWhite);
+  server.on("/cal/reset",  HTTP_POST, handleCalReset);
   server.onNotFound([]() {
     server.sendHeader("Location",
       String("http://") + (apMode ? WiFi.softAPIP().toString()
@@ -253,7 +277,7 @@ void setup() {
   tcsOK = tcs.begin();
   loadCal();
   if (cal.valid) { baseR = cal.wR; baseG = cal.wG; baseB = cal.wB; }
-  DBGLN(tcsOK ? "TCS3472 ready (2.4ms/1x)" : "TCS3472 NOT found — check wiring");
+  DBGLN(tcsOK ? "TCS3472 ready (2.4ms/16x)" : "TCS3472 NOT found — check wiring");
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
@@ -314,8 +338,12 @@ void loop() {
       uint16_t r, g, b, c;
       tcs.getRawData(&r, &g, &b, &c);
 
-      // Always update live globals so UI and cal captures are never stale
-      cR = r; cG = g; cB = b; cC = c;
+      // Always keep live globals current (used by /livedata and cal captures)
+      liveR = r; liveG = g; liveB = b; liveC = c;
+
+      // cR/cG/cB/cC reflect the committed (peak event) color for the swatch;
+      // seed them on first valid read so the UI isn't stuck at 0 before any event
+      if (cC == 0) { cR = r; cG = g; cB = b; cC = c; }
 
       float dR = fabsf((float)r - baseR);
       float dG = fabsf((float)g - baseG);
@@ -330,13 +358,11 @@ void loop() {
           eventSettleStart = 0;
           DBG("Color event start dev="); DBGLN(maxDev);
         } else {
-          // Slowly adapt baseline to track LED warmup/drift
           baseR += EMA_ALPHA * ((float)r - baseR);
           baseG += EMA_ALPHA * ((float)g - baseG);
           baseB += EMA_ALPHA * ((float)b - baseB);
         }
       } else {
-        // Track peak deviation during event
         if (maxDev > peakDeviation) {
           peakDeviation = maxDev;
           peakR = r; peakG = g; peakB = b; peakC = c;
@@ -344,7 +370,6 @@ void loop() {
         if (maxDev <= COLOR_DEVIATION_THRESH) {
           if (eventSettleStart == 0) eventSettleStart = millis();
           if (millis() - eventSettleStart >= COLOR_SETTLE_MS) {
-            // Commit peak — overwrite live values with the best color sample
             cR = peakR; cG = peakG; cB = peakB; cC = peakC;
             DBG("Color committed R="); DBG(cR); DBG(" G="); DBG(cG); DBG(" B="); DBGLN(cB);
             inColorEvent     = false;
