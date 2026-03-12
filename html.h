@@ -8,137 +8,183 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <title>Color Sensor</title>
 <style>
   *{box-sizing:border-box}
-  body{font-family:sans-serif;background:#111;color:#ddd;max-width:480px;margin:32px auto;padding:0 16px}
-  h1{font-size:1.3em;color:#aaa;margin-bottom:20px}
-  .card{background:#1e1e1e;border-radius:10px;padding:16px;margin:12px 0}
-  .swatch{height:80px;border-radius:8px;border:1px solid #333;margin-bottom:14px;transition:background .4s}
-  .swlive{height:40px;border-radius:6px;border:1px solid #333;margin-bottom:10px;transition:background .15s}
+  body{font-family:sans-serif;background:#111;color:#ddd;max-width:520px;margin:24px auto;padding:0 16px}
+  h1{font-size:1.2em;color:#aaa;margin-bottom:16px}
+  .card{background:#1e1e1e;border-radius:10px;padding:14px;margin:10px 0}
+  .swatch{height:70px;border-radius:7px;border:1px solid #333;margin-bottom:12px;transition:background .4s}
+  .swlive{height:32px;border-radius:5px;border:1px solid #2a2a2a;margin-bottom:8px;transition:background .15s}
   table{width:100%;border-collapse:collapse}
-  td{padding:4px 2px;font-size:.9em}
+  td{padding:3px 2px;font-size:.88em}
   td:last-child{text-align:right;font-weight:600;font-family:monospace}
-  .uid{font-family:monospace;font-size:1.15em;letter-spacing:2px;word-break:break-all;margin-top:6px}
-  .lbl{color:#888;font-size:.8em}
-  .sublbl{color:#666;font-size:.75em;margin-bottom:4px}
-  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#555;margin-right:6px}
+  .lbl{color:#888;font-size:.78em;margin-bottom:4px}
+  .namelabel{font-size:1.4em;font-weight:700;letter-spacing:1px;margin:4px 0 2px}
+  .distlabel{font-size:.78em;color:#888}
+  .evdot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#444;margin-right:5px;vertical-align:middle}
+  .evdot.on{background:#ff9800;box-shadow:0 0 5px #ff9800}
+  .uid{font-family:monospace;font-size:1.05em;letter-spacing:2px;word-break:break-all;margin-top:4px}
+  .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#444;margin-right:5px}
   .dot.ok{background:#4caf50}
-  .evdot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#555;margin-right:4px;vertical-align:middle}
-  .evdot.active{background:#ff9800;box-shadow:0 0 6px #ff9800}
-  .calbtn{flex:1;padding:9px;background:#2a2a2a;color:#eee;border:1px solid #555;border-radius:5px;cursor:pointer;font-size:.85em;line-height:1.4}
-  .calbtn:hover{background:#383838}
-  .calbtn.rst{color:#888;border-color:#444}
+  .calbtn{flex:1;padding:8px;background:#252525;color:#eee;border:1px solid #444;border-radius:5px;cursor:pointer;font-size:.82em;line-height:1.4}
+  .calbtn:hover{background:#333}
+  .calbtn.rst{color:#777;border-color:#333}
+  .tbtn{padding:7px 14px;background:#1565c0;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:.85em}
+  .tbtn:hover{background:#1976d2}
+  .dbtn{padding:4px 8px;background:#333;color:#e57373;border:1px solid #555;border-radius:4px;cursor:pointer;font-size:.78em}
+  .dbtn:hover{background:#b71c1c;color:#fff;border-color:#b71c1c}
+  .pfrow{display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid #2a2a2a}
+  .pfswatch{width:28px;height:28px;border-radius:4px;border:1px solid #333;flex-shrink:0}
+  .pfname{flex:1;font-size:.9em}
+  .pfrgb{font-family:monospace;font-size:.78em;color:#888}
+  input[type=text]{width:100%;padding:8px;background:#222;border:1px solid #444;color:#eee;border-radius:5px;font-size:.95em;margin-top:4px}
 </style>
 </head><body>
 <h1>🎨 Color Sensor Node</h1>
 
-<!-- Committed color (last peak event) -->
+<!-- Last detected result -->
 <div class="card">
-  <div class="lbl">Last Detected Color &nbsp;<span class="evdot" id="evdot"></span><span id="evlbl" style="font-size:.75em;color:#666">idle</span></div>
+  <div class="lbl">Last Detection &nbsp;<span class="evdot" id="evdot"></span><span id="evlbl" style="font-size:.75em;color:#666">idle</span></div>
   <div class="swatch" id="sw"></div>
-  <table>
-    <tr><td>R</td><td id="r">—</td></tr>
-    <tr><td>G</td><td id="g">—</td></tr>
-    <tr><td>B</td><td id="b">—</td></tr>
-    <tr><td>Clear</td><td id="c">—</td></tr>
+  <div class="namelabel" id="detname">—</div>
+  <div class="distlabel" id="detdist"></div>
+  <table style="margin-top:6px">
+    <tr><td>R / G / B (norm)</td><td id="rgb">—</td></tr>
     <tr><td>Hex</td><td id="hex">—</td></tr>
   </table>
 </div>
 
-<!-- Live raw readout -->
+<!-- Live raw -->
 <div class="card">
-  <div class="lbl">Live Raw</div>
+  <div class="lbl">Live</div>
   <div class="swlive" id="swlive"></div>
   <table>
-    <tr><td>R</td><td id="lr">—</td></tr>
-    <tr><td>G</td><td id="lg">—</td></tr>
-    <tr><td>B</td><td id="lb">—</td></tr>
-    <tr><td>Clear</td><td id="lc">—</td></tr>
+    <tr><td>Norm R/G/B</td><td id="norm">—</td></tr>
+    <tr><td>Raw R/G/B/C</td><td id="raw">—</td></tr>
     <tr><td>Deviation</td><td id="dev">—</td></tr>
-    <tr><td style="color:#555">Baseline R/G/B</td><td id="base" style="color:#555;font-size:.8em">—</td></tr>
+    <tr><td style="color:#555">Baseline</td><td id="base" style="color:#555">—</td></tr>
   </table>
 </div>
 
 <!-- RFID -->
 <div class="card">
-  <div class="lbl">RFID — Last Tag UID</div>
+  <div class="lbl">RFID — Last Tag</div>
   <div class="uid" id="uid">—</div>
+</div>
+
+<!-- Training -->
+<div class="card">
+  <div class="lbl">Color Profiles &nbsp;<span id="calst" style="color:#f44336">uncalibrated</span></div>
+  <div id="pflist" style="margin:8px 0"></div>
+  <div style="display:flex;gap:8px;align-items:flex-end;margin-top:8px">
+    <div style="flex:1">
+      <div style="font-size:.8em;color:#888;margin-bottom:3px">Name for current reading</div>
+      <input type="text" id="trainname" placeholder="e.g. Red Ball" maxlength="19">
+    </div>
+    <button class="tbtn" onclick="trainProfile()">+ Train</button>
+  </div>
+  <div id="trainmsg" style="font-size:.8em;color:#aaa;margin-top:6px;min-height:1em"></div>
 </div>
 
 <!-- Calibration -->
 <div class="card">
-  <div class="lbl">Calibration &nbsp;<span id="calst" style="color:#f44336">uncalibrated</span></div>
-  <div style="display:flex;gap:8px;margin-top:10px">
+  <div class="lbl">White Balance Calibration</div>
+  <div style="display:flex;gap:8px;margin-top:8px">
     <button class="calbtn" onclick="doCalStep('black')">⬛ Set Black<br><small>Cover sensor</small></button>
-    <button class="calbtn" onclick="doCalStep('white')">⬜ Set White<br><small>Point at white paper</small></button>
+    <button class="calbtn" onclick="doCalStep('white')">⬜ Set White<br><small>Point at white</small></button>
     <button class="calbtn rst" onclick="doCalStep('reset')">↺ Reset</button>
   </div>
-  <div id="calmsg" style="font-size:.8em;color:#aaa;margin-top:8px;min-height:1.2em"></div>
+  <div id="calmsg" style="font-size:.8em;color:#aaa;margin-top:6px;min-height:1em"></div>
 </div>
 
-<div style="text-align:right;font-size:.75em;color:#555">
+<div style="text-align:right;font-size:.72em;color:#444;margin-top:4px">
   <span class="dot" id="dot"></span><span id="ts">—</span>
 </div>
 
 <script>
-function toHex(r,g,b,max){
-  if(!max||max===0) return '#000000';
-  var R=Math.min(255,Math.round(r*255/max));
-  var G=Math.min(255,Math.round(g*255/max));
-  var B=Math.min(255,Math.round(b*255/max));
-  return '#'+[R,G,B].map(v=>v.toString(16).padStart(2,'0')).join('');
-}
+function hex3(r,g,b){return '#'+[r,g,b].map(v=>v.toString(16).padStart(2,'0')).join('');}
 
 function update(){
   fetch('/data').then(r=>r.json()).then(d=>{
-    document.getElementById('r').textContent   = d.r;
-    document.getElementById('g').textContent   = d.g;
-    document.getElementById('b').textContent   = d.b;
-    document.getElementById('c').textContent   = d.c;
+    document.getElementById('sw').style.background = d.hex;
+    document.getElementById('detname').textContent = d.name;
+    document.getElementById('detname').style.color = d.match ? '#fff' : '#888';
+    document.getElementById('detdist').textContent = d.match ? 'Distance: '+d.dist.toFixed(1) : (d.name==='\u2014'?'':'No trained match');
+    document.getElementById('rgb').textContent = d.r+' / '+d.g+' / '+d.b;
     document.getElementById('hex').textContent = d.hex;
     document.getElementById('uid').textContent = d.uid;
-    document.getElementById('sw').style.background = d.hex;
-    document.getElementById('dot').className   = 'dot ok';
-    document.getElementById('ts').textContent  = new Date().toLocaleTimeString();
+    document.getElementById('dot').className = 'dot ok';
+    document.getElementById('ts').textContent = new Date().toLocaleTimeString();
     var cs = document.getElementById('calst');
-    if(d.calOK){ cs.textContent='✓ calibrated'; cs.style.color='#4caf50'; }
-    else        { cs.textContent='uncalibrated';  cs.style.color='#f44336'; }
-    var ev = document.getElementById('evdot');
-    var evlbl = document.getElementById('evlbl');
-    if(d.event){ ev.className='evdot active'; evlbl.textContent='scanning…'; }
-    else       { ev.className='evdot';         evlbl.textContent='idle'; }
-  }).catch(()=>{ document.getElementById('dot').className='dot'; });
+    if(d.calOK){cs.textContent='✓ calibrated';cs.style.color='#4caf50';}
+    else{cs.textContent='uncalibrated';cs.style.color='#f44336';}
+    var ev=document.getElementById('evdot'), el=document.getElementById('evlbl');
+    if(d.event){ev.className='evdot on';el.textContent='scanning…';el.style.color='#ff9800';}
+    else{ev.className='evdot';el.textContent='idle';el.style.color='#555';}
+  }).catch(()=>{document.getElementById('dot').className='dot';});
 }
 
 function updateLive(){
   fetch('/livedata').then(r=>r.json()).then(d=>{
-    document.getElementById('lr').textContent  = d.lr;
-    document.getElementById('lg').textContent  = d.lg;
-    document.getElementById('lb').textContent  = d.lb;
-    document.getElementById('lc').textContent  = d.lc;
-    document.getElementById('dev').textContent = d.dev;
-    document.getElementById('base').textContent= d.bR+' / '+d.bG+' / '+d.bB;
-    var max = Math.max(d.lr, d.lg, d.lb, 1);
-    document.getElementById('swlive').style.background = toHex(d.lr, d.lg, d.lb, max);
+    document.getElementById('swlive').style.background = d.hex;
+    document.getElementById('norm').textContent = d.nr+' / '+d.ng+' / '+d.nb;
+    document.getElementById('raw').textContent  = d.lr+' / '+d.lg+' / '+d.lb+' / '+d.lc;
+    document.getElementById('dev').textContent  = d.dev;
+    document.getElementById('base').textContent = d.bR+' / '+d.bG+' / '+d.bB;
   }).catch(()=>{});
+}
+
+function loadProfiles(){
+  fetch('/profiles').then(r=>r.json()).then(list=>{
+    var el=document.getElementById('pflist');
+    if(!list.length){el.innerHTML='<div style="color:#555;font-size:.85em">No profiles yet.</div>';return;}
+    el.innerHTML=list.map(p=>
+      '<div class="pfrow">'+
+      '<div class="pfswatch" style="background:'+p.hex+'"></div>'+
+      '<div class="pfname">'+p.name+'<br><span class="pfrgb">'+p.hex+' &nbsp; '+p.r+'/'+p.g+'/'+p.b+'</span></div>'+
+      '<button class="dbtn" onclick="delProfile('+p.i+')">Delete</button>'+
+      '</div>'
+    ).join('');
+  });
+}
+
+function trainProfile(){
+  var name=document.getElementById('trainname').value.trim();
+  if(!name){document.getElementById('trainmsg').textContent='Enter a name first.';return;}
+  var fd=new FormData(); fd.append('name',name);
+  fetch('/profiles/train',{method:'POST',body:fd}).then(r=>r.json()).then(d=>{
+    if(d.ok){
+      document.getElementById('trainmsg').textContent='✓ Saved "'+d.name+'" as '+d.hex;
+      document.getElementById('trainname').value='';
+      loadProfiles();
+    } else {
+      document.getElementById('trainmsg').textContent='Error: '+d.error;
+    }
+  }).catch(()=>{document.getElementById('trainmsg').textContent='Request failed.';});
+}
+
+function delProfile(i){
+  var fd=new FormData(); fd.append('i',i);
+  fetch('/profiles/delete',{method:'POST',body:fd}).then(r=>r.json()).then(()=>loadProfiles());
 }
 
 function doCalStep(type){
   fetch('/cal/'+type,{method:'POST'}).then(r=>r.json()).then(()=>{
-    var msg = document.getElementById('calmsg');
-    if(type==='black') msg.textContent='Black saved — now point at white paper and tap Set White.';
-    else if(type==='white') msg.textContent='White saved — calibration active!';
+    var msg=document.getElementById('calmsg');
+    if(type==='black') msg.textContent='Black saved — now point at white and tap Set White.';
+    else if(type==='white') msg.textContent='White saved — calibration active! Re-train profiles now.';
     else msg.textContent='Calibration cleared.';
     update();
-  }).catch(()=>{ document.getElementById('calmsg').textContent='Error — try again.'; });
+  }).catch(()=>{document.getElementById('calmsg').textContent='Error — try again.';});
 }
 
 update();
-setInterval(update, 1000);      // committed color + cal status
-setInterval(updateLive, 250);   // live raw strip updates 4x/sec
+loadProfiles();
+setInterval(update, 1000);
+setInterval(updateLive, 250);
 </script>
 </body></html>
 )rawliteral";
 
-// ── Captive portal / WiFi config page ────────────────────────────────────────
+// ── Captive portal ────────────────────────────────────────────────────────────────
 const char WIFI_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html><head>

@@ -13,10 +13,11 @@
 #include <MFRC522.h>
 #include <Wire.h>
 #include <Adafruit_TCS34725.h>
-#include <Secrets.h>   // defines MYSSID, MYPSK
+#include <ArduinoJson.h>
+#include <Secrets.h>
 #include "html.h"
 
-// ── Debug toggle (set 0 to disable all serial output) ────────────────────────
+// ── Debug toggle ───────────────────────────────────────────────────────────────────
 #define DEBUG 1
 #if DEBUG
   #define DBG(x)   Serial.print(x)
@@ -33,51 +34,112 @@
 #define WIFI_TIMEOUT_MS  12000UL
 #define RECONNECT_MS      5000UL
 
-// ── RFID — SPI (custom pins) ──────────────────────────────────────────────────
+// ── RFID pins ───────────────────────────────────────────────────────────────────
 #define RFID_SS    7
 #define RFID_SCK   8
 #define RFID_MISO  9
 #define RFID_MOSI  10
 #define RFID_RST   1
 
-// ── TCS3472 — I2C ─────────────────────────────────────────────────────────────
+// ── TCS3472 pins ────────────────────────────────────────────────────────────────
 #define COLOR_SDA  4
 #define COLOR_SCL  6
 
-// ── Color event detection tuning ─────────────────────────────────────────────
-// At 2.4ms + 16x gain: max ~4096 counts. Tune THRESH to ~5-10% of your white baseline.
-#define COLOR_DEVIATION_THRESH  30    // raw counts — lower = more sensitive
-#define COLOR_SETTLE_MS         80    // ms back at baseline before committing event
-#define EMA_ALPHA               0.05f // baseline drift rate
+// ── Detection tuning ───────────────────────────────────────────────────────────
+// Deviation is measured on normalised 0-255 channels, not raw counts.
+// THRESH: minimum normalised deviation to consider a ball present (tune 5-20).
+// SETTLE: ms of stable baseline before an event is committed.
+#define DETECT_THRESH   10
+#define SETTLE_MS       100
+#define EMA_ALPHA       0.04f
+
+// ── Training ───────────────────────────────────────────────────────────────────
+#define MAX_PROFILES    16
+#define NAME_LEN        20
+
+struct ColorProfile {
+  char     name[NAME_LEN];
+  uint8_t  r, g, b;      // normalised 0-255 training values
+  bool     used = false;
+};
+
+ColorProfile profiles[MAX_PROFILES];
+uint8_t      numProfiles = 0;
+
+void loadProfiles() {
+  prefs.begin("profiles", true);
+  numProfiles = prefs.getUChar("count", 0);
+  for (uint8_t i = 0; i < numProfiles && i < MAX_PROFILES; i++) {
+    String key = "p" + String(i);
+    prefs.getBytes(key.c_str(), &profiles[i], sizeof(ColorProfile));
+    profiles[i].used = true;
+  }
+  prefs.end();
+  DBG("Loaded profiles: "); DBGLN(numProfiles);
+}
+
+void saveProfiles() {
+  prefs.begin("profiles", false);
+  prefs.putUChar("count", numProfiles);
+  for (uint8_t i = 0; i < numProfiles; i++) {
+    String key = "p" + String(i);
+    prefs.putBytes(key.c_str(), &profiles[i], sizeof(ColorProfile));
+  }
+  prefs.end();
+}
+
+// Euclidean distance in normalised RGB space
+float profileDist(const ColorProfile &p, uint8_t r, uint8_t g, uint8_t b) {
+  float dr = (float)p.r - r;
+  float dg = (float)p.g - g;
+  float db = (float)p.b - b;
+  return sqrtf(dr*dr + dg*dg + db*db);
+}
+
+// Returns index of nearest profile, or -1 if no profiles or dist > maxDist
+int matchProfile(uint8_t r, uint8_t g, uint8_t b, float maxDist = 60.0f) {
+  int   best  = -1;
+  float bestD = maxDist;
+  for (uint8_t i = 0; i < numProfiles; i++) {
+    float d = profileDist(profiles[i], r, g, b);
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  return best;
+}
 
 // ── Objects ───────────────────────────────────────────────────────────────────
 Preferences       prefs;
 WebServer         server(80);
 DNSServer         dns;
 MFRC522           rfid(RFID_SS, RFID_RST);
-// 2.4ms integration + 16x gain: fast sampling with enough sensitivity for typical LEDs
-// If still saturating (counts near 4096) drop to TCS34725_GAIN_4X
-// If still too low, increase to TCS34725_GAIN_60X
 Adafruit_TCS34725 tcs(TCS34725_INTEGRATIONTIME_2_4MS, TCS34725_GAIN_16X);
 
-bool     apMode  = false;
-bool     tcsOK   = false;
-String   lastUID = "None";
+bool   apMode = false;
+bool   tcsOK  = false;
+String lastUID = "None";
 
-// Live sensor values — always updated every poll
-uint16_t cR = 0, cG = 0, cB = 0, cC = 0;
-
-// Live raw values (never overwritten by event commit, always current)
+// Live raw sensor readings (always current)
 uint16_t liveR = 0, liveG = 0, liveB = 0, liveC = 0;
 
-// ── Baseline + event state ────────────────────────────────────────────────────
-float    baseR = 512, baseG = 512, baseB = 512;
-bool     inColorEvent     = false;
-uint32_t eventSettleStart = 0;
-uint16_t peakR = 0, peakG = 0, peakB = 0, peakC = 0;
-float    peakDeviation    = 0;
+// Normalised live values (0-255)
+uint8_t  normR = 0, normG = 0, normB = 0;
 
-// ── Calibration ─────────────────────────────────────────────────────────────────
+// Last committed detection result
+uint8_t  detR = 128, detG = 128, detB = 128;
+String   detName   = "—";
+float    detDist   = 0;
+bool     detMatch  = false;
+
+// ── EMA baseline (normalised space) ─────────────────────────────────────────────
+float baseR = 128, baseG = 128, baseB = 128;
+
+// ── Event state ─────────────────────────────────────────────────────────────────
+bool     inEvent       = false;
+uint32_t settleStart   = 0;
+uint8_t  peakR = 0, peakG = 0, peakB = 0;
+float    peakDev       = 0;
+
+// ── White calibration ──────────────────────────────────────────────────────────
 struct CalData {
   uint16_t dR, dG, dB;
   uint16_t wR, wG, wB;
@@ -110,7 +172,20 @@ uint8_t calCh(uint16_t raw, uint16_t dark, uint16_t white) {
   return (uint8_t)constrain((int32_t)(raw - dark) * 255 / (white - dark), 0, 255);
 }
 
-// ── WiFi helpers ──────────────────────────────────────────────────────────────
+void updateNorm() {
+  if (cal.valid) {
+    normR = calCh(liveR, cal.dR, cal.wR);
+    normG = calCh(liveG, cal.dG, cal.wG);
+    normB = calCh(liveB, cal.dB, cal.wB);
+  } else {
+    uint32_t s = liveC ? liveC : 1;
+    normR = (uint8_t)min(255UL, (uint32_t)liveR * 255UL / s);
+    normG = (uint8_t)min(255UL, (uint32_t)liveG * 255UL / s);
+    normB = (uint8_t)min(255UL, (uint32_t)liveB * 255UL / s);
+  }
+}
+
+// ── WiFi ───────────────────────────────────────────────────────────────────────
 bool connectWiFi(const String &ssid, const String &psk) {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
@@ -149,44 +224,96 @@ void handleRoot() {
   server.send_P(200, "text/html", apMode ? WIFI_HTML : INDEX_HTML);
 }
 
-// Committed color — last peak from a color event (shown as swatch)
+// Last committed detection result
 void handleData() {
-  uint8_t R, G, B;
-  if (cal.valid) {
-    R = calCh(cR, cal.dR, cal.wR);
-    G = calCh(cG, cal.dG, cal.wG);
-    B = calCh(cB, cal.dB, cal.wB);
-  } else {
-    uint32_t s = cC ? cC : 1;
-    R = (uint8_t)min(255UL, (uint32_t)cR * 255UL / s);
-    G = (uint8_t)min(255UL, (uint32_t)cG * 255UL / s);
-    B = (uint8_t)min(255UL, (uint32_t)cB * 255UL / s);
-  }
   char hex[8];
-  snprintf(hex, sizeof(hex), "#%02X%02X%02X", R, G, B);
-  String j = "{\"r\":"  + String(cR) + ",\"g\":"  + String(cG) +
-             ",\"b\":"  + String(cB) + ",\"c\":"  + String(cC) +
-             ",\"hex\":\"" + hex + "\",\"uid\":\"" + lastUID + "\"" +
+  snprintf(hex, sizeof(hex), "#%02X%02X%02X", detR, detG, detB);
+  String j = "{\"r\":" + String(detR) + ",\"g\":" + String(detG) + ",\"b\":" + String(detB) +
+             ",\"hex\":\"" + hex + "\"" +
+             ",\"name\":\"" + detName + "\"" +
+             ",\"dist\":" + String(detDist, 1) +
+             ",\"match\":" + (detMatch ? "true" : "false") +
+             ",\"uid\":\"" + lastUID + "\"" +
              ",\"calOK\":" + (cal.valid ? "true" : "false") +
-             ",\"event\":" + (inColorEvent ? "true" : "false") + "}";
+             ",\"event\":" + (inEvent ? "true" : "false") + "}";
   server.send(200, "application/json", j);
 }
 
-// Live raw values — always current, used by the live readout strip
+// Live normalised + raw values
 void handleLiveData() {
-  float dev = max(fabsf((float)liveR - baseR),
-             max(fabsf((float)liveG - baseG),
-                 fabsf((float)liveB - baseB)));
-  String j = "{\"lr\":" + String(liveR) +
-             ",\"lg\":" + String(liveG) +
-             ",\"lb\":" + String(liveB) +
-             ",\"lc\":" + String(liveC) +
+  float dR = fabsf((float)normR - baseR);
+  float dG = fabsf((float)normG - baseG);
+  float dB = fabsf((float)normB - baseB);
+  float dev = max(dR, max(dG, dB));
+  char hex[8];
+  snprintf(hex, sizeof(hex), "#%02X%02X%02X", normR, normG, normB);
+  String j = "{\"lr\":" + String(liveR) + ",\"lg\":" + String(liveG) +
+             ",\"lb\":" + String(liveB) + ",\"lc\":" + String(liveC) +
+             ",\"nr\":" + String(normR) + ",\"ng\":" + String(normG) +
+             ",\"nb\":" + String(normB) +
+             ",\"hex\":\"" + hex + "\"" +
              ",\"dev\":" + String((int)dev) +
-             ",\"bR\":"  + String((int)baseR) +
-             ",\"bG\":"  + String((int)baseG) +
-             ",\"bB\":"  + String((int)baseB) +
-             ",\"event\":" + (inColorEvent ? "true" : "false") + "}";
+             ",\"bR\":" + String((int)baseR) +
+             ",\"bG\":" + String((int)baseG) +
+             ",\"bB\":" + String((int)baseB) +
+             ",\"event\":" + (inEvent ? "true" : "false") + "}";
   server.send(200, "application/json", j);
+}
+
+// List all training profiles as JSON array
+void handleProfilesList() {
+  String j = "[";
+  for (uint8_t i = 0; i < numProfiles; i++) {
+    char hex[8];
+    snprintf(hex, sizeof(hex), "#%02X%02X%02X", profiles[i].r, profiles[i].g, profiles[i].b);
+    if (i) j += ",";
+    j += "{\"i\":" + String(i) +
+         ",\"name\":\"" + String(profiles[i].name) + "\"" +
+         ",\"r\":" + String(profiles[i].r) +
+         ",\"g\":" + String(profiles[i].g) +
+         ",\"b\":" + String(profiles[i].b) +
+         ",\"hex\":\"" + hex + "\"}";
+  }
+  j += "]";
+  server.send(200, "application/json", j);
+}
+
+// Save current live normalised reading as a new named profile
+void handleProfileTrain() {
+  if (!server.hasArg("name") || server.arg("name").length() == 0) {
+    server.send(400, "application/json", "{\"error\":\"Missing name\"}");
+    return;
+  }
+  if (numProfiles >= MAX_PROFILES) {
+    server.send(400, "application/json", "{\"error\":\"Max profiles reached\"}");
+    return;
+  }
+  String name = server.arg("name");
+  name.trim();
+  ColorProfile &p = profiles[numProfiles];
+  strncpy(p.name, name.c_str(), NAME_LEN - 1);
+  p.name[NAME_LEN - 1] = 0;
+  p.r = normR; p.g = normG; p.b = normB;
+  p.used = true;
+  numProfiles++;
+  saveProfiles();
+  char hex[8];
+  snprintf(hex, sizeof(hex), "#%02X%02X%02X", p.r, p.g, p.b);
+  DBG("Trained "); DBG(p.name); DBG(" R="); DBG(p.r); DBG(" G="); DBG(p.g); DBG(" B="); DBGLN(p.b);
+  String j = "{\"ok\":true,\"name\":\"" + String(p.name) + "\",\"hex\":\"" + hex + "\"}";
+  server.send(200, "application/json", j);
+}
+
+// Delete a profile by index
+void handleProfileDelete() {
+  if (!server.hasArg("i")) { server.send(400, "application/json", "{\"error\":\"Missing i\"}"); return; }
+  uint8_t idx = server.arg("i").toInt();
+  if (idx >= numProfiles) { server.send(400, "application/json", "{\"error\":\"Bad index\"}"); return; }
+  // Shift remaining profiles down
+  for (uint8_t i = idx; i < numProfiles - 1; i++) profiles[i] = profiles[i + 1];
+  numProfiles--;
+  saveProfiles();
+  server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleSetWifi() {
@@ -205,7 +332,7 @@ void handleSetWifi() {
 void handleCalBlack() {
   cal.dR = liveR; cal.dG = liveG; cal.dB = liveB;
   saveCal();
-  DBG("Cal black: R="); DBG(cal.dR); DBG(" G="); DBG(cal.dG); DBG(" B="); DBGLN(cal.dB);
+  DBG("Cal black R="); DBG(cal.dR); DBG(" G="); DBG(cal.dG); DBG(" B="); DBGLN(cal.dB);
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -213,9 +340,9 @@ void handleCalWhite() {
   cal.wR = liveR; cal.wG = liveG; cal.wB = liveB;
   cal.valid = true;
   saveCal();
-  baseR = cal.wR; baseG = cal.wG; baseB = cal.wB;
-  cR = liveR; cG = liveG; cB = liveB; cC = liveC;
-  DBG("Cal white: R="); DBG(cal.wR); DBG(" G="); DBG(cal.wG); DBG(" B="); DBGLN(cal.wB);
+  updateNorm();
+  baseR = normR; baseG = normG; baseB = normB;
+  DBG("Cal white R="); DBG(cal.wR); DBG(" G="); DBG(cal.wG); DBG(" B="); DBGLN(cal.wB);
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -226,13 +353,16 @@ void handleCalReset() {
 }
 
 void setupServer() {
-  server.on("/",           HTTP_GET,  handleRoot);
-  server.on("/data",       HTTP_GET,  handleData);
-  server.on("/livedata",   HTTP_GET,  handleLiveData);
-  server.on("/setwifi",    HTTP_POST, handleSetWifi);
-  server.on("/cal/black",  HTTP_POST, handleCalBlack);
-  server.on("/cal/white",  HTTP_POST, handleCalWhite);
-  server.on("/cal/reset",  HTTP_POST, handleCalReset);
+  server.on("/",               HTTP_GET,  handleRoot);
+  server.on("/data",           HTTP_GET,  handleData);
+  server.on("/livedata",       HTTP_GET,  handleLiveData);
+  server.on("/profiles",       HTTP_GET,  handleProfilesList);
+  server.on("/profiles/train", HTTP_POST, handleProfileTrain);
+  server.on("/profiles/delete",HTTP_POST, handleProfileDelete);
+  server.on("/setwifi",        HTTP_POST, handleSetWifi);
+  server.on("/cal/black",      HTTP_POST, handleCalBlack);
+  server.on("/cal/white",      HTTP_POST, handleCalWhite);
+  server.on("/cal/reset",      HTTP_POST, handleCalReset);
   server.onNotFound([]() {
     server.sendHeader("Location",
       String("http://") + (apMode ? WiFi.softAPIP().toString()
@@ -255,28 +385,28 @@ void setup() {
   String psk  = prefs.getString("psk",  MYPSK);
   prefs.end();
 
-  if (connectWiFi(ssid, psk))
-    startNetServices();
-  else
-    startCaptivePortal();
+  if (connectWiFi(ssid, psk)) startNetServices();
+  else                         startCaptivePortal();
 
   setupServer();
 
-  // SPI → MFRC522
   SPI.begin(RFID_SCK, RFID_MISO, RFID_MOSI, RFID_SS);
   rfid.PCD_Init();
   rfid.PCD_SetAntennaGain(rfid.RxGain_max);
   #if DEBUG
-    DBG("RFID gain register: 0x");
+    DBG("RFID gain: 0x");
     DBGLN(String(rfid.PCD_ReadRegister(rfid.RFCfgReg), HEX));
   #endif
   DBGLN("RFID ready");
 
-  // I2C → TCS3472
   Wire.begin(COLOR_SDA, COLOR_SCL);
   tcsOK = tcs.begin();
   loadCal();
-  if (cal.valid) { baseR = cal.wR; baseG = cal.wG; baseB = cal.wB; }
+  loadProfiles();
+  if (cal.valid) {
+    // Seed baseline at normalised white
+    baseR = 255; baseG = 255; baseB = 255;
+  }
   DBGLN(tcsOK ? "TCS3472 ready (2.4ms/16x)" : "TCS3472 NOT found — check wiring");
 }
 
@@ -300,13 +430,11 @@ void loop() {
   else         ArduinoOTA.handle();
   server.handleClient();
 
-  // ── RFID fast scan (WUPA — wakes all tags including halted) ──────────────────
+  // ── RFID ───────────────────────────────────────────────────────────────────
   {
     static bool tagWasPresent = false;
-    byte bufferATQA[2];
-    byte bufferSize = sizeof(bufferATQA);
-    MFRC522::StatusCode wakeStatus = rfid.PICC_WakeupA(bufferATQA, &bufferSize);
-    if (wakeStatus == MFRC522::STATUS_OK) {
+    byte buf[2]; byte bsz = sizeof(buf);
+    if (rfid.PICC_WakeupA(buf, &bsz) == MFRC522::STATUS_OK) {
       if (rfid.PICC_ReadCardSerial()) {
         String uid = "";
         for (byte i = 0; i < rfid.uid.size; i++) {
@@ -315,70 +443,71 @@ void loop() {
           uid += String(rfid.uid.uidByte[i], HEX);
         }
         uid.toUpperCase();
-        if (uid != lastUID) {
-          lastUID = uid;
-          DBG("RFID: "); DBGLN(lastUID);
-        }
+        if (uid != lastUID) { lastUID = uid; DBG("RFID: "); DBGLN(lastUID); }
         tagWasPresent = true;
         rfid.PCD_StopCrypto1();
       }
     } else {
-      if (tagWasPresent) {
-        tagWasPresent = false;
-        //DBGLN("RFID: tag left field");
-      }
+      tagWasPresent = false;
     }
   }
 
-  // ── Color sensor — always update live values, detect deviation events ────────
+  // ── Color sensor ────────────────────────────────────────────────────────────────
   {
-    static unsigned long lastColorPoll = 0;
-    if (tcsOK && millis() - lastColorPoll >= 3) {
-      lastColorPoll = millis();
-      uint16_t r, g, b, c;
-      tcs.getRawData(&r, &g, &b, &c);
+    static unsigned long lastPoll = 0;
+    if (tcsOK && millis() - lastPoll >= 3) {
+      lastPoll = millis();
+      tcs.getRawData(&liveR, &liveG, &liveB, &liveC);
+      updateNorm();  // always recompute normalised values
 
-      // Always keep live globals current (used by /livedata and cal captures)
-      liveR = r; liveG = g; liveB = b; liveC = c;
-
-      // cR/cG/cB/cC reflect the committed (peak event) color for the swatch;
-      // seed them on first valid read so the UI isn't stuck at 0 before any event
-      if (cC == 0) { cR = r; cG = g; cB = b; cC = c; }
-
-      float dR = fabsf((float)r - baseR);
-      float dG = fabsf((float)g - baseG);
-      float dB = fabsf((float)b - baseB);
+      float dR = fabsf((float)normR - baseR);
+      float dG = fabsf((float)normG - baseG);
+      float dB = fabsf((float)normB - baseB);
       float maxDev = max(dR, max(dG, dB));
 
-      if (!inColorEvent) {
-        if (maxDev > COLOR_DEVIATION_THRESH) {
-          inColorEvent     = true;
-          peakDeviation    = maxDev;
-          peakR = r; peakG = g; peakB = b; peakC = c;
-          eventSettleStart = 0;
-          DBG("Color event start dev="); DBGLN(maxDev);
+      if (!inEvent) {
+        if (maxDev > DETECT_THRESH) {
+          inEvent    = true;
+          peakDev    = maxDev;
+          peakR = normR; peakG = normG; peakB = normB;
+          settleStart = 0;
+          DBG("Event start dev="); DBGLN(maxDev);
         } else {
-          baseR += EMA_ALPHA * ((float)r - baseR);
-          baseG += EMA_ALPHA * ((float)g - baseG);
-          baseB += EMA_ALPHA * ((float)b - baseB);
+          // Adapt baseline slowly when idle
+          baseR += EMA_ALPHA * ((float)normR - baseR);
+          baseG += EMA_ALPHA * ((float)normG - baseG);
+          baseB += EMA_ALPHA * ((float)normB - baseB);
         }
       } else {
-        if (maxDev > peakDeviation) {
-          peakDeviation = maxDev;
-          peakR = r; peakG = g; peakB = b; peakC = c;
+        // Track sample with greatest deviation during the event
+        if (maxDev > peakDev) {
+          peakDev = maxDev;
+          peakR = normR; peakG = normG; peakB = normB;
         }
-        if (maxDev <= COLOR_DEVIATION_THRESH) {
-          if (eventSettleStart == 0) eventSettleStart = millis();
-          if (millis() - eventSettleStart >= COLOR_SETTLE_MS) {
-            cR = peakR; cG = peakG; cB = peakB; cC = peakC;
-            DBG("Color committed R="); DBG(cR); DBG(" G="); DBG(cG); DBG(" B="); DBGLN(cB);
-            inColorEvent     = false;
-            eventSettleStart = 0;
-            peakDeviation    = 0;
-            baseR = (float)r; baseG = (float)g; baseB = (float)b;
+        if (maxDev <= DETECT_THRESH) {
+          if (settleStart == 0) settleStart = millis();
+          if (millis() - settleStart >= SETTLE_MS) {
+            // Commit: classify peak against trained profiles
+            detR = peakR; detG = peakG; detB = peakB;
+            int match = matchProfile(peakR, peakG, peakB);
+            if (match >= 0) {
+              detName  = String(profiles[match].name);
+              detDist  = profileDist(profiles[match], peakR, peakG, peakB);
+              detMatch = true;
+              DBG("Match: "); DBG(detName); DBG(" dist="); DBGLN(detDist);
+            } else {
+              detName  = "Unknown";
+              detDist  = 0;
+              detMatch = false;
+              DBG("No match for R="); DBG(peakR); DBG(" G="); DBG(peakG); DBG(" B="); DBGLN(peakB);
+            }
+            inEvent     = false;
+            settleStart = 0;
+            peakDev     = 0;
+            baseR = normR; baseG = normG; baseB = normB;
           }
         } else {
-          eventSettleStart = 0;
+          settleStart = 0;
         }
       }
     }
