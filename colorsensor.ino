@@ -32,7 +32,6 @@
 // ── Timing ────────────────────────────────────────────────────────────────────
 #define WIFI_TIMEOUT_MS  12000UL   // connect attempt window
 #define RECONNECT_MS      5000UL   // retry interval when disconnected
-#define COLOR_INTERVAL_MS  100UL   // sensor poll rate
 
 // ── RFID — SPI (custom pins) ──────────────────────────────────────────────────
 #define RFID_SS    7    // RC522 "SDA" = SPI CS
@@ -45,17 +44,30 @@
 #define COLOR_SDA  4
 #define COLOR_SCL  6
 
+// ── Color event detection tuning ─────────────────────────────────────────────
+#define COLOR_DEVIATION_THRESH  80    // raw counts (out of 1024 max at 2.4ms)
+#define COLOR_SETTLE_MS         80    // ms back at baseline before committing event
+#define EMA_ALPHA               0.05f // baseline drift rate (higher = faster adapt)
+
 // ── Objects ───────────────────────────────────────────────────────────────────
 Preferences       prefs;
 WebServer         server(80);
 DNSServer         dns;
 MFRC522           rfid(RFID_SS, RFID_RST);
-Adafruit_TCS34725 tcs(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_4X);
+// 2.4ms integration + 1x gain: ~400Hz sample rate, max 1024 counts — ideal for LED-lit fast pass-by
+Adafruit_TCS34725 tcs(TCS34725_INTEGRATIONTIME_2_4MS, TCS34725_GAIN_1X);
 
 bool     apMode  = false;
 bool     tcsOK   = false;
 String   lastUID = "None";
-uint16_t cR = 0, cG = 0, cB = 0, cC = 0;
+uint16_t cR = 0, cG = 0, cB = 0, cC = 0;  // current/committed sensor values
+
+// ── Baseline + event state ────────────────────────────────────────────────────
+float    baseR = 512, baseG = 512, baseB = 512;  // EMA white baseline
+bool     inColorEvent    = false;
+uint32_t eventSettleStart = 0;
+uint16_t peakR = 0, peakG = 0, peakB = 0, peakC = 0;
+float    peakDeviation   = 0;
 
 // ── Calibration (2-point: black + white per channel) ─────────────────────────
 struct CalData {
@@ -70,9 +82,9 @@ void loadCal() {
   cal.dR    = prefs.getUShort("dR", 0);
   cal.dG    = prefs.getUShort("dG", 0);
   cal.dB    = prefs.getUShort("dB", 0);
-  cal.wR    = prefs.getUShort("wR", 65535);
-  cal.wG    = prefs.getUShort("wG", 65535);
-  cal.wB    = prefs.getUShort("wB", 65535);
+  cal.wR    = prefs.getUShort("wR", 1023);
+  cal.wG    = prefs.getUShort("wG", 1023);
+  cal.wB    = prefs.getUShort("wB", 1023);
   cal.valid = prefs.getBool("calOK", false);
   prefs.end();
 }
@@ -148,7 +160,8 @@ void handleData() {
   String j = "{\"r\":"  + String(cR) + ",\"g\":"  + String(cG) +
              ",\"b\":"  + String(cB) + ",\"c\":"  + String(cC) +
              ",\"hex\":\"" + hex + "\",\"uid\":\"" + lastUID + "\"" +
-             ",\"calOK\":" + (cal.valid ? "true" : "false") + "}";
+             ",\"calOK\":" + (cal.valid ? "true" : "false") +
+             ",\"event\":" + (inColorEvent ? "true" : "false") + "}";
   server.send(200, "application/json", j);
 }
 
@@ -166,7 +179,6 @@ void handleSetWifi() {
 }
 
 void handleCalBlack() {
-  // Capture with sensor covered or pointing at matte black
   cal.dR = cR; cal.dG = cG; cal.dB = cB;
   saveCal();
   DBGLN("Cal black saved");
@@ -174,29 +186,28 @@ void handleCalBlack() {
 }
 
 void handleCalWhite() {
-  // Capture pointing at matte white paper under your normal lighting
   cal.wR = cR; cal.wG = cG; cal.wB = cB;
   cal.valid = true;
   saveCal();
+  // Seed baseline from white cal point
+  baseR = cal.wR; baseG = cal.wG; baseB = cal.wB;
   DBGLN("Cal white saved");
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleCalReset() {
   prefs.begin("cal", false); prefs.clear(); prefs.end();
-  cal = {0, 0, 0, 65535, 65535, 65535, false};
+  cal = {0, 0, 0, 1023, 1023, 1023, false};
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
 void setupServer() {
-  server.on("/",        HTTP_GET,  handleRoot);
-  server.on("/data",    HTTP_GET,  handleData);
-  server.on("/setwifi", HTTP_POST, handleSetWifi);
+  server.on("/",          HTTP_GET,  handleRoot);
+  server.on("/data",      HTTP_GET,  handleData);
+  server.on("/setwifi",   HTTP_POST, handleSetWifi);
   server.on("/cal/black", HTTP_POST, handleCalBlack);
   server.on("/cal/white", HTTP_POST, handleCalWhite);
   server.on("/cal/reset", HTTP_POST, handleCalReset);
-
-  // Captive portal: redirect anything unknown to root
   server.onNotFound([]() {
     server.sendHeader("Location",
       String("http://") + (apMode ? WiFi.softAPIP().toString()
@@ -214,7 +225,6 @@ void setup() {
 #endif
   DBGLN("\n== " HOSTNAME " ==");
 
-  // Load saved credentials; fall back to compiled-in Secrets.h values
   prefs.begin("wifi", true);
   String ssid = prefs.getString("ssid", MYSSID);
   String psk  = prefs.getString("psk",  MYPSK);
@@ -230,13 +240,20 @@ void setup() {
   // SPI → MFRC522
   SPI.begin(RFID_SCK, RFID_MISO, RFID_MOSI, RFID_SS);
   rfid.PCD_Init();
+  rfid.PCD_SetAntennaGain(rfid.RxGain_max);  // 48 dB max receiver gain
+  #if DEBUG
+    DBG("RFID gain register: 0x");
+    DBGLN(String(rfid.PCD_ReadRegister(rfid.RFCfgReg), HEX));
+  #endif
   DBGLN("RFID ready");
 
   // I2C → TCS3472
   Wire.begin(COLOR_SDA, COLOR_SCL);
   tcsOK = tcs.begin();
   loadCal();
-  DBGLN(tcsOK ? "TCS3472 ready" : "TCS3472 NOT found — check wiring");
+  // Seed EMA baseline from cal white point if available, else midscale
+  if (cal.valid) { baseR = cal.wR; baseG = cal.wG; baseB = cal.wB; }
+  DBGLN(tcsOK ? "TCS3472 ready (2.4ms/1x)" : "TCS3472 NOT found — check wiring");
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
@@ -259,24 +276,85 @@ void loop() {
   else         ArduinoOTA.handle();
   server.handleClient();
 
-  // ── RFID scan ────────────────────────────────────────────────────────────────
-  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-    lastUID = "";
-    for (byte i = 0; i < rfid.uid.size; i++) {
-      if (i) lastUID += ':';
-      if (rfid.uid.uidByte[i] < 0x10) lastUID += '0';
-      lastUID += String(rfid.uid.uidByte[i], HEX);
+  // ── RFID fast scan (WUPA — wakes all tags including halted) ──────────────────
+  {
+    static bool tagWasPresent = false;
+    byte bufferATQA[2];
+    byte bufferSize = sizeof(bufferATQA);
+    MFRC522::StatusCode wakeStatus = rfid.PICC_WakeupA(bufferATQA, &bufferSize);
+    if (wakeStatus == MFRC522::STATUS_OK) {
+      if (rfid.PICC_ReadCardSerial()) {
+        String uid = "";
+        for (byte i = 0; i < rfid.uid.size; i++) {
+          if (i) uid += ':';
+          if (rfid.uid.uidByte[i] < 0x10) uid += '0';
+          uid += String(rfid.uid.uidByte[i], HEX);
+        }
+        uid.toUpperCase();
+        if (uid != lastUID) {
+          lastUID = uid;
+          DBG("RFID: "); DBGLN(lastUID);
+        }
+        tagWasPresent = true;
+        // Intentionally no PICC_HaltA() — tag stays ACTIVE for faster re-detection
+        rfid.PCD_StopCrypto1();
+      }
+    } else {
+      if (tagWasPresent) {
+        tagWasPresent = false;
+        DBGLN("RFID: tag left field");
+      }
     }
-    lastUID.toUpperCase();
-    DBG("RFID: "); DBGLN(lastUID);
-    rfid.PICC_HaltA();
-    rfid.PCD_StopCrypto1();
   }
 
-  // ── Color sensor (throttled) ─────────────────────────────────────────────────
-  static unsigned long lastColor = 0;
-  if (tcsOK && millis() - lastColor > COLOR_INTERVAL_MS) {
-    tcs.getRawData(&cR, &cG, &cB, &cC);
-    lastColor = millis();
+  // ── Color sensor — fast deviation event detection (~300 samples/sec) ─────────
+  {
+    static unsigned long lastColorPoll = 0;
+    if (tcsOK && millis() - lastColorPoll >= 3) {  // > 2.4ms integration time
+      lastColorPoll = millis();
+      uint16_t r, g, b, c;
+      tcs.getRawData(&r, &g, &b, &c);
+
+      float dR = fabsf((float)r - baseR);
+      float dG = fabsf((float)g - baseG);
+      float dB = fabsf((float)b - baseB);
+      float maxDev = max(dR, max(dG, dB));
+
+      if (!inColorEvent) {
+        if (maxDev > COLOR_DEVIATION_THRESH) {
+          inColorEvent   = true;
+          peakDeviation  = maxDev;
+          peakR = r; peakG = g; peakB = b; peakC = c;
+          eventSettleStart = 0;
+          DBG("Color event start dev="); DBGLN(maxDev);
+        } else {
+          // No event — slowly update EMA baseline to track LED drift
+          baseR += EMA_ALPHA * ((float)r - baseR);
+          baseG += EMA_ALPHA * ((float)g - baseG);
+          baseB += EMA_ALPHA * ((float)b - baseB);
+        }
+      } else {
+        // In event — keep peak deviation sample
+        if (maxDev > peakDeviation) {
+          peakDeviation = maxDev;
+          peakR = r; peakG = g; peakB = b; peakC = c;
+        }
+        if (maxDev <= COLOR_DEVIATION_THRESH) {
+          if (eventSettleStart == 0) eventSettleStart = millis();
+          if (millis() - eventSettleStart >= COLOR_SETTLE_MS) {
+            // Commit peak sample — expose to web UI via cR/cG/cB/cC
+            cR = peakR; cG = peakG; cB = peakB; cC = peakC;
+            DBG("Color committed R="); DBG(cR); DBG(" G="); DBG(cG); DBG(" B="); DBGLN(cB);
+            inColorEvent     = false;
+            eventSettleStart = 0;
+            peakDeviation    = 0;
+            // Re-seed baseline from current settled reading
+            baseR = (float)r; baseG = (float)g; baseB = (float)b;
+          }
+        } else {
+          eventSettleStart = 0;  // still deviating — reset settle timer
+        }
+      }
+    }
   }
 }
