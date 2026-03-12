@@ -66,39 +66,41 @@ struct DetectSettings {
 };
 
 // ── EM4100 125kHz Manchester decoder (RDM630 DEMOD_OUT on GPIO 0) ──────────────
-// SHD pin on RDM630 tied permanently LOW in hardware (always active).
-// MOD pin tied permanently LOW in hardware (read-only mode).
-//
-// Timing (from captured traces):
-//   Half-bit period : ~256 us  (range 150–400 us)
-//   Full-bit period : ~512 us  (range 400–650 us)
-//
 // EM4100 frame = 64 bits:
 //   9  header bits (all 1)
 //   10 rows × 5 bits (4 data + 1 even row-parity)
 //   4  column-parity bits
 //   1  stop bit (0)
+//
+// Timing at 125kHz / RF/64 data rate:
+//   Half-bit period : ~256 us
+//   Full-bit period : ~512 us
+// We use a 100us dead-zone between half and full to avoid boundary misclassification.
 
 #define EM4100_PIN       0
-#define EM_HALF_MIN_US   150
-#define EM_HALF_MAX_US   400
-#define EM_FULL_MIN_US   400
-#define EM_FULL_MAX_US   650
-#define EM_IDLE_US       2000
+#define EM_HALF_MIN_US   120   // generous low end
+#define EM_HALF_MAX_US   350   // half ends here
+// 350–450 us = dead zone, pulses rejected & buffer reset
+#define EM_FULL_MIN_US   450   // full starts here
+#define EM_FULL_MAX_US   700   // generous high end
+#define EM_IDLE_US       1500  // gap longer than this = frame boundary
 #define EM_FRAME_BITS    64
 #define EM_HEADER_BITS   9
-#define EM_MAX_HALFBUF   160
+// Store ~2.5 frames so sliding window always has a complete frame to find
+#define EM_MAX_HALFBUF   352   // 64*2*2 + margin
+// Only flag frameReady once we have at least 2 full frames accumulated
+#define EM_READY_THRESH  (EM_FRAME_BITS * 4)
 
 volatile uint32_t em_lastEdge   = 0;
 volatile uint8_t  em_halfBuf[EM_MAX_HALFBUF];
-volatile uint8_t  em_halfCount  = 0;
+volatile uint16_t em_halfCount  = 0;
 volatile bool     em_frameReady = false;
-volatile uint32_t em_dbgEdges   = 0;   // total ISR edge count, never reset
+volatile uint32_t em_dbgEdges   = 0;
 
 String last125ID = "None";
 
 void IRAM_ATTR em4100_isr() {
-  em_dbgEdges++;                        // always count, even on idle/reset
+  em_dbgEdges++;
   uint32_t now   = micros();
   uint32_t width = now - em_lastEdge;
   em_lastEdge    = now;
@@ -109,28 +111,31 @@ void IRAM_ATTR em4100_isr() {
   uint8_t level = (uint8_t)digitalRead(EM4100_PIN);
   uint8_t prev  = level ^ 1;
 
-  if (width >= EM_HALF_MIN_US && width < EM_HALF_MAX_US) {
+  if (width >= EM_HALF_MIN_US && width <= EM_HALF_MAX_US) {
+    // half-bit period
     if (em_halfCount < EM_MAX_HALFBUF)
       em_halfBuf[em_halfCount++] = prev;
-  } else if (width >= EM_FULL_MIN_US && width < EM_FULL_MAX_US) {
+  } else if (width >= EM_FULL_MIN_US && width <= EM_FULL_MAX_US) {
+    // full-bit period = two identical half-periods
     if (em_halfCount + 1 < EM_MAX_HALFBUF) {
       em_halfBuf[em_halfCount++] = prev;
       em_halfBuf[em_halfCount++] = prev;
     }
   } else {
+    // out-of-range width (incl. dead zone 350–450 us) — reset accumulator
     em_halfCount = 0;
     return;
   }
 
-  if (em_halfCount >= (uint8_t)(EM_FRAME_BITS * 2 + 1))
+  if (em_halfCount >= EM_READY_THRESH)
     em_frameReady = true;
 }
 
-static uint8_t manchesterDecode(const uint8_t *hp, uint8_t len,
-                                uint8_t offset, uint8_t *bits, uint8_t nBits) {
+static uint8_t manchesterDecode(const uint8_t *hp, uint16_t len,
+                                uint16_t offset, uint8_t *bits, uint8_t nBits) {
   uint8_t errors = 0;
   for (uint8_t i = 0; i < nBits; i++) {
-    uint8_t idx = offset + i * 2;
+    uint16_t idx = offset + i * 2;
     if (idx + 1 >= len) { errors++; continue; }
     uint8_t a = hp[idx], b = hp[idx + 1];
     if      (a == 0 && b == 1) bits[i] = 1;
@@ -176,8 +181,9 @@ static bool em4100Validate(const uint8_t *bits, char *hexOut) {
 void em4100Process() {
   if (!em_frameReady) return;
 
-  uint8_t hp[EM_MAX_HALFBUF];
-  uint8_t hpLen;
+  // Snapshot ISR buffer
+  uint8_t  hp[EM_MAX_HALFBUF];
+  uint16_t hpLen;
   noInterrupts();
   hpLen = em_halfCount;
   memcpy(hp, (const void*)em_halfBuf, hpLen);
@@ -185,25 +191,36 @@ void em4100Process() {
   em_frameReady = false;
   interrupts();
 
-  if (hpLen < EM_FRAME_BITS * 2) return;
+  if (hpLen < (uint16_t)(EM_FRAME_BITS * 2)) return;
 
   uint8_t bits[EM_FRAME_BITS];
   char    hexOut[11];
 
-  for (uint8_t offset = 0; offset <= 1; offset++) {
+  // Slide across every even offset in the buffer looking for a valid frame.
+  // Even offsets only because Manchester pairs are 2 half-periods wide.
+  uint16_t maxOffset = hpLen - (EM_FRAME_BITS * 2);
+  for (uint16_t offset = 0; offset <= maxOffset; offset += 2) {
     uint8_t errs = manchesterDecode(hp, hpLen, offset, bits, EM_FRAME_BITS);
     if (errs > 0) continue;
     if (em4100Validate(bits, hexOut)) {
       String newID = String(hexOut);
       if (newID != last125ID) {
         last125ID = newID;
-        DBG("[125k] Card: "); DBGLN(last125ID);
+        DBG("[125k] Card: "); DBG(last125ID);
+        DBG(" (offset="); DBG(offset); DBG(" hpLen="); DBG(hpLen); DBGLN(")");
       }
       return;
     }
   }
-  // Frame accumulated but failed to validate — log for debug
-  DBG("[125k] frame rx'd but validate failed, hpLen="); DBGLN(hpLen);
+
+  // All offsets failed — dump diagnostics
+  DBG("[125k] validate failed hpLen="); DBG(hpLen);
+  DBG(" offsets_tried="); DBGLN(maxOffset / 2 + 1);
+  // Decode at offset 0 and show first 9 bits so we can see what header looks like
+  manchesterDecode(hp, hpLen, 0, bits, EM_FRAME_BITS < 16 ? EM_FRAME_BITS : 16);
+  DBG("  hdr[0..8]=");
+  for (uint8_t i = 0; i < 9; i++) { DBG(bits[i] == 0xFF ? 'X' : (char)('0' + bits[i])); }
+  DBGLN();
 }
 
 // ── All globals ─────────────────────────────────────────────────────────────────
@@ -406,10 +423,9 @@ void handleLiveData() {
   server.send(200, "application/json", j);
 }
 
-// Debug endpoint: 125kHz ISR health
 void handleDebug125() {
   uint32_t edges;
-  uint8_t  hcount;
+  uint16_t hcount;
   bool     frdy;
   noInterrupts();
   edges  = em_dbgEdges;
@@ -419,7 +435,7 @@ void handleDebug125() {
   String j = "{\"edges\":"     + String(edges) +
              ",\"halfCount\":" + String(hcount) +
              ",\"frameReady\":" + (frdy ? "true" : "false") +
-             ",\"id125\":\""   + last125ID + "\"}"; 
+             ",\"id125\":\""   + last125ID + "\"}";
   server.send(200, "application/json", j);
 }
 
