@@ -93,10 +93,12 @@ volatile uint32_t em_lastEdge   = 0;
 volatile uint8_t  em_halfBuf[EM_MAX_HALFBUF];
 volatile uint8_t  em_halfCount  = 0;
 volatile bool     em_frameReady = false;
+volatile uint32_t em_dbgEdges   = 0;   // total ISR edge count, never reset
 
 String last125ID = "None";
 
 void IRAM_ATTR em4100_isr() {
+  em_dbgEdges++;                        // always count, even on idle/reset
   uint32_t now   = micros();
   uint32_t width = now - em_lastEdge;
   em_lastEdge    = now;
@@ -200,6 +202,8 @@ void em4100Process() {
       return;
     }
   }
+  // Frame accumulated but failed to validate — log for debug
+  DBG("[125k] frame rx'd but validate failed, hpLen="); DBGLN(hpLen);
 }
 
 // ── All globals ─────────────────────────────────────────────────────────────────
@@ -402,6 +406,23 @@ void handleLiveData() {
   server.send(200, "application/json", j);
 }
 
+// Debug endpoint: 125kHz ISR health
+void handleDebug125() {
+  uint32_t edges;
+  uint8_t  hcount;
+  bool     frdy;
+  noInterrupts();
+  edges  = em_dbgEdges;
+  hcount = em_halfCount;
+  frdy   = em_frameReady;
+  interrupts();
+  String j = "{\"edges\":"     + String(edges) +
+             ",\"halfCount\":" + String(hcount) +
+             ",\"frameReady\":" + (frdy ? "true" : "false") +
+             ",\"id125\":\""   + last125ID + "\"}"; 
+  server.send(200, "application/json", j);
+}
+
 void handleProfilesList() {
   String j = "[";
   for (uint8_t i = 0; i < numProfiles; i++) {
@@ -495,6 +516,7 @@ void setupServer() {
   server.on("/",                 HTTP_GET,  handleRoot);
   server.on("/data",             HTTP_GET,  handleData);
   server.on("/livedata",         HTTP_GET,  handleLiveData);
+  server.on("/debug125",         HTTP_GET,  handleDebug125);
   server.on("/profiles",         HTTP_GET,  handleProfilesList);
   server.on("/profiles/train",   HTTP_POST, handleProfileTrain);
   server.on("/profiles/delete",  HTTP_POST, handleProfileDelete);

@@ -48,6 +48,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .calst{font-size:.75em}
   .bar{height:6px;border-radius:3px;background:#333;margin-top:4px;overflow:hidden}
   .barfill{height:100%;border-radius:3px;background:#4caf50;transition:width .3s}
+  .dbgrow td{color:#555;font-size:.75em}
+  .dbgrow td:last-child{color:#888}
 </style>
 </head><body>
 <h1>🎨 Color Sensor</h1>
@@ -84,7 +86,24 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!-- RFID -->
 <div class="card">
   <div class="lbl">RFID</div>
-  <div class="uid" id="uid">—</div>
+  <table>
+    <tr>
+      <td>13.56 MHz (MFRC522)</td>
+      <td class="uid" id="uid">—</td>
+    </tr>
+    <tr>
+      <td>125 kHz (EM4100)</td>
+      <td class="uid" id="id125">—</td>
+    </tr>
+    <tr class="dbgrow">
+      <td>125k ISR edges / halfbuf</td>
+      <td id="em_dbg">—</td>
+    </tr>
+    <tr class="dbgrow">
+      <td>125k frame ready</td>
+      <td id="em_frdy">—</td>
+    </tr>
+  </table>
 </div>
 
 <!-- Training -->
@@ -134,9 +153,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <div class="card">
   <h2>White Balance Cal</h2>
   <div class="row">
-    <button class="calbtn" onclick="doCalStep('black')">⬛ Set Black<br><small>Cover sensor</small></button>
-    <button class="calbtn" onclick="doCalStep('white')">⬜ Set White<br><small>Open / LED on</small></button>
-    <button class="calbtn" style="color:#555;border-color:#333" onclick="doCalStep('reset')">↺ Reset</button>
+    <button class="calbtn" onclick="doCalStep('black')">&#11035; Set Black<br><small>Cover sensor</small></button>
+    <button class="calbtn" onclick="doCalStep('white')">&#11036; Set White<br><small>Open / LED on</small></button>
+    <button class="calbtn" style="color:#555;border-color:#333" onclick="doCalStep('reset')">&#8634; Reset</button>
   </div>
   <div class="msg" id="calmsg"></div>
 </div>
@@ -152,14 +171,15 @@ function update(){
     var nm=document.getElementById('detname');
     nm.textContent=d.name; nm.style.color=d.match?'#fff':'#777';
     var conf=d.match?d.conf:0;
-    document.getElementById('detconf').textContent=d.match?('Confidence: '+conf.toFixed(1)+'%  \u00b7  dist: '+d.dist.toFixed(1)):(d.name==='\u2014'?'':'—');
+    document.getElementById('detconf').textContent=d.match?('Confidence: '+conf.toFixed(1)+'%  \u00b7  dist: '+d.dist.toFixed(1)):(d.name==='\u2014'?'':'\u2014');
     document.getElementById('confbar').style.width=conf.toFixed(0)+'%';
     document.getElementById('confbar').style.background=conf>70?'#4caf50':conf>40?'#ff9800':'#f44336';
     document.getElementById('rgb').textContent=d.r+' / '+d.g+' / '+d.b;
     document.getElementById('hex').textContent=d.hex;
     document.getElementById('dist').textContent=d.dist.toFixed(1);
     document.getElementById('evdur').textContent=d.evDur+'ms';
-    document.getElementById('uid').textContent=d.uid;
+    document.getElementById('uid').textContent=d.uid||'\u2014';
+    document.getElementById('id125').textContent=d.id125||'\u2014';
     document.getElementById('dot').className='dot ok';
     document.getElementById('ts').textContent=new Date().toLocaleTimeString();
     var cs=document.getElementById('calst');
@@ -179,17 +199,24 @@ function updateLive(){
     document.getElementById('trigdisp').textContent=(d.trigRatio*100).toFixed(0)+'%';
     var rat=d.cRatio;
     var rc=document.getElementById('cratio');
-    rc.textContent=rat.toFixed(3)+(rat<d.trigRatio?' ⚠️ triggering':'');
+    rc.textContent=rat.toFixed(3)+(rat<d.trigRatio?' \u26a0\ufe0f triggering':'');
     rc.style.color=rat<d.trigRatio?'#ff9800':'#ddd';
     document.getElementById('lavg').textContent=d.avgR+' / '+d.avgG+' / '+d.avgB;
     document.getElementById('ldur').textContent=d.lastDur+'ms';
   }).catch(()=>{});
 }
 
+function updateDebug125(){
+  fetch('/debug125').then(r=>r.json()).then(d=>{
+    document.getElementById('em_dbg').textContent=d.edges+' / '+d.halfCount;
+    document.getElementById('em_frdy').textContent=d.frameReady?'YES ✓':'no';
+  }).catch(()=>{});
+}
+
 function loadProfiles(){
   fetch('/profiles').then(r=>r.json()).then(list=>{
     var el=document.getElementById('pflist');
-    if(!list.length){el.innerHTML='<div style="color:#444;font-size:.85em;padding:4px 0">No profiles yet — hold a ball in front and tap Train.</div>';return;}
+    if(!list.length){el.innerHTML='<div style="color:#444;font-size:.85em;padding:4px 0">No profiles yet \u2014 hold a ball in front and tap Train.</div>';return;}
     el.innerHTML=list.map(p=>
       '<div class="pfrow">'+
       '<div class="pfswatch" style="background:'+p.hex+'"></div>'+
@@ -244,12 +271,13 @@ function doCalStep(type){
     else if(type==='white') m.textContent='White saved \u2014 calibration active! Re-train profiles if needed.';
     else m.textContent='Calibration cleared.';
     update();
-  }).catch(()=>{document.getElementById('calmsg').textContent='Error — try again.';});
+  }).catch(()=>{document.getElementById('calmsg').textContent='Error \u2014 try again.';});
 }
 
-update(); loadProfiles(); loadSettings();
+update(); loadProfiles(); loadSettings(); updateDebug125();
 setInterval(update, 1000);
 setInterval(updateLive, 250);
+setInterval(updateDebug125, 500);
 </script>
 </body></html>
 )rawliteral";
@@ -266,7 +294,7 @@ const char WIFI_HTML[] PROGMEM = R"rawliteral(
   .note{font-size:.8em;color:#555;margin-top:18px}
 </style>
 </head><body>
-<h2>📶 WiFi Setup</h2>
+<h2>&#x1F4F6; WiFi Setup</h2>
 <form method="POST" action="/setwifi">
   <label>SSID</label><input type="text" name="ssid" autocomplete="off" required>
   <label>Password</label><input type="password" name="psk">
