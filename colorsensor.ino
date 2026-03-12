@@ -325,7 +325,7 @@ void loop() {
     } else {
       if (tagWasPresent) {
         tagWasPresent = false;
-        DBGLN("RFID: tag left field");
+        //DBGLN("RFID: tag left field");
       }
     }
   }
