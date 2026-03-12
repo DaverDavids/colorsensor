@@ -40,10 +40,34 @@
 #define COLOR_SDA 4
 #define COLOR_SCL 6
 
+// ── Constants & Structs (must precede all function definitions) ────────────────
+#define MAX_PROFILES 16
+#define NAME_LEN     20
+#define SAMP_BUF     64
+
+struct ColorProfile {
+  char    name[NAME_LEN];
+  uint8_t r, g, b;
+  bool    used = false;
+};
+
+struct CalData {
+  uint16_t dR, dG, dB;
+  uint16_t wR, wG, wB;
+  bool valid = false;
+};
+
+struct DetectSettings {
+  float    trigRatio;   // default 0.85
+  uint16_t minEventMs;  // default 20
+  uint16_t maxEventMs;  // default 2000
+  float    matchDist;   // default 120.0
+  float    emaAlpha;    // default 0.05
+};
+
 // ── EM4100 125kHz Manchester decoder (RDM630 DEMOD_OUT on GPIO 0) ──────────────
-// SHD pin on RDM630 chip is tied permanently LOW in hardware (always active).
+// SHD pin on RDM630 tied permanently LOW in hardware (always active).
 // MOD pin tied permanently LOW in hardware (read-only mode).
-// Only GPIO 0 is required.
 //
 // Timing (from captured traces):
 //   Half-bit period : ~256 us  (range 150–400 us)
@@ -60,65 +84,48 @@
 #define EM_HALF_MAX_US   400
 #define EM_FULL_MIN_US   400
 #define EM_FULL_MAX_US   650
-#define EM_IDLE_US       2000   // gap longer than this = frame boundary / reset
+#define EM_IDLE_US       2000
 #define EM_FRAME_BITS    64
 #define EM_HEADER_BITS   9
-#define EM_MAX_HALFBUF   160    // 64 bits × 2 half-periods + margin
+#define EM_MAX_HALFBUF   160
 
-// ISR-side state (volatile)
-volatile uint32_t em_lastEdge    = 0;
+volatile uint32_t em_lastEdge   = 0;
 volatile uint8_t  em_halfBuf[EM_MAX_HALFBUF];
-volatile uint8_t  em_halfCount   = 0;
-volatile bool     em_frameReady  = false;
+volatile uint8_t  em_halfCount  = 0;
+volatile bool     em_frameReady = false;
 
-// Main-loop decoded result
-String  last125ID  = "None";   // 10-char hex, e.g. "F373DA8C04"
+String last125ID = "None";
 
-// ISR — fires on every edge of DEMOD_OUT
 void IRAM_ATTR em4100_isr() {
   uint32_t now   = micros();
   uint32_t width = now - em_lastEdge;
   em_lastEdge    = now;
 
-  // Idle gap resets accumulator
-  if (width > EM_IDLE_US) {
-    em_halfCount = 0;
-    return;
-  }
+  if (width > EM_IDLE_US) { em_halfCount = 0; return; }
+  if (em_frameReady) return;
 
-  if (em_frameReady) return;   // main loop hasn't consumed last frame yet
-
-  // Determine level that just ENDED (level before this edge)
-  uint8_t level = (uint8_t)digitalRead(EM4100_PIN); // new level after edge
-  uint8_t prev  = level ^ 1;                        // level that just ended
+  uint8_t level = (uint8_t)digitalRead(EM4100_PIN);
+  uint8_t prev  = level ^ 1;
 
   if (width >= EM_HALF_MIN_US && width < EM_HALF_MAX_US) {
-    // Half-bit: one half-period
     if (em_halfCount < EM_MAX_HALFBUF)
       em_halfBuf[em_halfCount++] = prev;
   } else if (width >= EM_FULL_MIN_US && width < EM_FULL_MAX_US) {
-    // Full-bit: two identical half-periods
     if (em_halfCount + 1 < EM_MAX_HALFBUF) {
       em_halfBuf[em_halfCount++] = prev;
       em_halfBuf[em_halfCount++] = prev;
     }
   } else {
-    // Unrecognised width — reset
     em_halfCount = 0;
     return;
   }
 
-  // Need at least (EM_FRAME_BITS * 2) + 1 half-periods to try a decode
-  // (+1 for phase-offset search)
-  if (em_halfCount >= (uint8_t)(EM_FRAME_BITS * 2 + 1)) {
+  if (em_halfCount >= (uint8_t)(EM_FRAME_BITS * 2 + 1))
     em_frameReady = true;
-  }
 }
 
-// Decode Manchester bits from half-period buffer at given start offset.
-// Returns number of decode errors (invalid pairs).
 static uint8_t manchesterDecode(const uint8_t *hp, uint8_t len,
-                                  uint8_t offset, uint8_t *bits, uint8_t nBits) {
+                                uint8_t offset, uint8_t *bits, uint8_t nBits) {
   uint8_t errors = 0;
   for (uint8_t i = 0; i < nBits; i++) {
     uint8_t idx = offset + i * 2;
@@ -131,10 +138,7 @@ static uint8_t manchesterDecode(const uint8_t *hp, uint8_t len,
   return errors;
 }
 
-// Validate and extract card ID from 64 decoded bits.
-// Returns true and fills hexOut (11 bytes incl. null) on success.
 static bool em4100Validate(const uint8_t *bits, char *hexOut) {
-  // Header: bits 0-8 must all be 1
   for (uint8_t i = 0; i < EM_HEADER_BITS; i++)
     if (bits[i] != 1) return false;
 
@@ -146,56 +150,30 @@ static bool em4100Validate(const uint8_t *bits, char *hexOut) {
     uint8_t d0 = bits[base], d1 = bits[base+1],
             d2 = bits[base+2], d3 = bits[base+3],
             rp = bits[base+4];
-    // Reject any error markers
     if (d0 > 1 || d1 > 1 || d2 > 1 || d3 > 1 || rp > 1) return false;
-    // Row parity (even)
     if (((d0 ^ d1 ^ d2 ^ d3) & 1) != rp) return false;
-    cardBits[row*4]   = d0;
-    cardBits[row*4+1] = d1;
-    cardBits[row*4+2] = d2;
-    cardBits[row*4+3] = d3;
+    cardBits[row*4]   = d0; cardBits[row*4+1] = d1;
+    cardBits[row*4+2] = d2; cardBits[row*4+3] = d3;
     colAcc[0] ^= d0; colAcc[1] ^= d1;
     colAcc[2] ^= d2; colAcc[3] ^= d3;
   }
 
-  // Column parity: bits 59-62
   uint8_t cpBase = EM_HEADER_BITS + 50;
   for (uint8_t c = 0; c < 4; c++)
     if (bits[cpBase + c] != colAcc[c]) return false;
 
-  // Stop bit: bit 63 must be 0
   if (bits[63] != 0) return false;
 
-  // Build hex string from 40 card bits (5 bytes)
-  uint32_t hi =  ((uint32_t)cardBits[0]  << 7) | ((uint32_t)cardBits[1]  << 6) |
-                 ((uint32_t)cardBits[2]  << 5) | ((uint32_t)cardBits[3]  << 4) |
-                 ((uint32_t)cardBits[4]  << 3) | ((uint32_t)cardBits[5]  << 2) |
-                 ((uint32_t)cardBits[6]  << 1) |  (uint32_t)cardBits[7];
-  uint32_t lo =  ((uint32_t)cardBits[8]  << 31)| ((uint32_t)cardBits[9]  << 30)|
-                 ((uint32_t)cardBits[10] << 29)| ((uint32_t)cardBits[11] << 28)|
-                 ((uint32_t)cardBits[12] << 27)| ((uint32_t)cardBits[13] << 26)|
-                 ((uint32_t)cardBits[14] << 25)| ((uint32_t)cardBits[15] << 24)|
-                 ((uint32_t)cardBits[16] << 23)| ((uint32_t)cardBits[17] << 22)|
-                 ((uint32_t)cardBits[18] << 21)| ((uint32_t)cardBits[19] << 20)|
-                 ((uint32_t)cardBits[20] << 19)| ((uint32_t)cardBits[21] << 18)|
-                 ((uint32_t)cardBits[22] << 17)| ((uint32_t)cardBits[23] << 16)|
-                 ((uint32_t)cardBits[24] << 15)| ((uint32_t)cardBits[25] << 14)|
-                 ((uint32_t)cardBits[26] << 13)| ((uint32_t)cardBits[27] << 12)|
-                 ((uint32_t)cardBits[28] << 11)| ((uint32_t)cardBits[29] << 10)|
-                 ((uint32_t)cardBits[30] << 9) | ((uint32_t)cardBits[31] << 8) |
-                 ((uint32_t)cardBits[32] << 7) | ((uint32_t)cardBits[33] << 6) |
-                 ((uint32_t)cardBits[34] << 5) | ((uint32_t)cardBits[35] << 4) |
-                 ((uint32_t)cardBits[36] << 3) | ((uint32_t)cardBits[37] << 2) |
-                 ((uint32_t)cardBits[38] << 1) |  (uint32_t)cardBits[39];
+  uint32_t hi = 0, lo = 0;
+  for (uint8_t i = 0; i < 8;  i++) hi = (hi << 1) | cardBits[i];
+  for (uint8_t i = 8; i < 40; i++) lo = (lo << 1) | cardBits[i];
   snprintf(hexOut, 11, "%02X%08X", (unsigned)hi, (unsigned)lo);
   return true;
 }
 
-// Called from loop() — processes em_frameReady flag outside ISR context
 void em4100Process() {
   if (!em_frameReady) return;
 
-  // Snapshot ISR buffer
   uint8_t hp[EM_MAX_HALFBUF];
   uint8_t hpLen;
   noInterrupts();
@@ -207,7 +185,6 @@ void em4100Process() {
 
   if (hpLen < EM_FRAME_BITS * 2) return;
 
-  // Try both phase offsets (0 and 1) — offset 1 required per trace analysis
   uint8_t bits[EM_FRAME_BITS];
   char    hexOut[11];
 
@@ -224,33 +201,6 @@ void em4100Process() {
     }
   }
 }
-
-// ── Training ──────────────────────────────────────────────────────────────────
-#define MAX_PROFILES 16
-#define NAME_LEN     20
-#define SAMP_BUF     64   // max samples to average per event
-
-// ── Structs ───────────────────────────────────────────────────────────────────
-struct ColorProfile {
-  char    name[NAME_LEN];
-  uint8_t r, g, b;
-  bool    used = false;
-};
-
-struct CalData {
-  uint16_t dR, dG, dB;
-  uint16_t wR, wG, wB;
-  bool valid = false;
-};
-
-// ── Tunable detection settings (loaded from NVS, editable via UI) ──────────────
-struct DetectSettings {
-  float    trigRatio;   // default 0.85
-  uint16_t minEventMs;  // default 20
-  uint16_t maxEventMs;  // default 2000
-  float    matchDist;   // default 120.0
-  float    emaAlpha;    // default 0.05
-};
 
 // ── All globals ─────────────────────────────────────────────────────────────────
 Preferences       prefs;
@@ -276,16 +226,16 @@ bool     detMatch  = false;
 uint32_t detEventMs = 0;
 
 enum EventState { IDLE, ACTIVE, SETTLING };
-EventState evState     = IDLE;
-uint32_t   evStartMs   = 0;
-uint32_t   evEndMs     = 0;
+EventState evState   = IDLE;
+uint32_t   evStartMs = 0;
+uint32_t   evEndMs   = 0;
 float      accumR = 0, accumG = 0, accumB = 0;
 uint16_t   accumN = 0;
 uint8_t    sampR[SAMP_BUF], sampG[SAMP_BUF], sampB[SAMP_BUF];
 uint8_t    sampHead = 0;
 
-float    lastEventDur = 0;
-float    lastAvgR = 0, lastAvgG = 0, lastAvgB = 0;
+float lastEventDur = 0;
+float lastAvgR = 0, lastAvgG = 0, lastAvgB = 0;
 
 CalData        cal;
 ColorProfile   profiles[MAX_PROFILES];
@@ -424,8 +374,8 @@ void handleData() {
   snprintf(hex, sizeof(hex), "#%02X%02X%02X", detR, detG, detB);
   String j = "{\"r\":" + String(detR) + ",\"g\":" + String(detG) + ",\"b\":" + String(detB) +
     ",\"hex\":\"" + hex + "\",\"name\":\"" + detName + "\"" +
-    ",\"dist\":"  + String(detDist, 1) +
-    ",\"conf\":"  + String(detConf, 1) +
+    ",\"dist\":"   + String(detDist, 1) +
+    ",\"conf\":"   + String(detConf, 1) +
     ",\"match\":"  + (detMatch ? "true" : "false") +
     ",\"uid\":\""  + lastUID   + "\"" +
     ",\"id125\":\"" + last125ID + "\"" +
@@ -598,7 +548,6 @@ void setup() {
   DBG(" matchDist="); DBG(ds.matchDist);
   DBG(" ema="); DBGLN(ds.emaAlpha);
 
-  // EM4100 125kHz decoder — GPIO 0, interrupt on every edge
   pinMode(EM4100_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(EM4100_PIN), em4100_isr, CHANGE);
   DBGLN("EM4100 decoder ready → GPIO 0");
@@ -606,7 +555,6 @@ void setup() {
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
 void loop() {
-  // WiFi reconnect
   static unsigned long lastReconnect = 0;
   if (!apMode && WiFi.status() != WL_CONNECTED && millis() - lastReconnect > RECONNECT_MS) {
     lastReconnect = millis(); DBGLN("WiFi lost — reconnecting…");
@@ -619,7 +567,6 @@ void loop() {
   if (apMode) dns.processNextRequest(); else ArduinoOTA.handle();
   server.handleClient();
 
-  // EM4100 125kHz Manchester decode
   em4100Process();
 
   // MFRC522 13.56MHz RFID
