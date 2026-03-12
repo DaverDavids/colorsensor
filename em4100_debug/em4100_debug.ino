@@ -52,7 +52,8 @@ void IRAM_ATTR em4100_isr() {
   if (em_frameReady) return;
 
   uint8_t level = (uint8_t)digitalRead(EM4100_PIN);
-  uint8_t prev  = level ^ 1;
+  //uint8_t prev  = level ^ 1;
+  uint8_t prev  = level;
 
   if (width >= EM_HALF_MIN_US && width <= EM_HALF_MAX_US) {
     if (em_halfCount < EM_MAX_HALFBUF)
