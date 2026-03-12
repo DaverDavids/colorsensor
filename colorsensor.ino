@@ -1,5 +1,6 @@
 // =============================================================================
 //  colorsensor.ino  —  ESP32-C3 | MFRC522 (SPI) + TCS3472 (I2C) | WiFi UI
+//                      + EM4100 125kHz RFID via RDM630 Manchester on GPIO 0
 //  Libs: MFRC522, Adafruit_TCS34725, ArduinoOTA, ESPmDNS, Preferences
 // =============================================================================
 
@@ -39,6 +40,191 @@
 #define COLOR_SDA 4
 #define COLOR_SCL 6
 
+// ── EM4100 125kHz Manchester decoder (RDM630 DEMOD_OUT on GPIO 0) ──────────────
+// SHD pin on RDM630 chip is tied permanently LOW in hardware (always active).
+// MOD pin tied permanently LOW in hardware (read-only mode).
+// Only GPIO 0 is required.
+//
+// Timing (from captured traces):
+//   Half-bit period : ~256 us  (range 150–400 us)
+//   Full-bit period : ~512 us  (range 400–650 us)
+//
+// EM4100 frame = 64 bits:
+//   9  header bits (all 1)
+//   10 rows × 5 bits (4 data + 1 even row-parity)
+//   4  column-parity bits
+//   1  stop bit (0)
+
+#define EM4100_PIN       0
+#define EM_HALF_MIN_US   150
+#define EM_HALF_MAX_US   400
+#define EM_FULL_MIN_US   400
+#define EM_FULL_MAX_US   650
+#define EM_IDLE_US       2000   // gap longer than this = frame boundary / reset
+#define EM_FRAME_BITS    64
+#define EM_HEADER_BITS   9
+#define EM_MAX_HALFBUF   160    // 64 bits × 2 half-periods + margin
+
+// ISR-side state (volatile)
+volatile uint32_t em_lastEdge    = 0;
+volatile uint8_t  em_halfBuf[EM_MAX_HALFBUF];
+volatile uint8_t  em_halfCount   = 0;
+volatile bool     em_frameReady  = false;
+
+// Main-loop decoded result
+String  last125ID  = "None";   // 10-char hex, e.g. "F373DA8C04"
+
+// ISR — fires on every edge of DEMOD_OUT
+void IRAM_ATTR em4100_isr() {
+  uint32_t now   = micros();
+  uint32_t width = now - em_lastEdge;
+  em_lastEdge    = now;
+
+  // Idle gap resets accumulator
+  if (width > EM_IDLE_US) {
+    em_halfCount = 0;
+    return;
+  }
+
+  if (em_frameReady) return;   // main loop hasn't consumed last frame yet
+
+  // Determine level that just ENDED (level before this edge)
+  uint8_t level = (uint8_t)digitalRead(EM4100_PIN); // new level after edge
+  uint8_t prev  = level ^ 1;                        // level that just ended
+
+  if (width >= EM_HALF_MIN_US && width < EM_HALF_MAX_US) {
+    // Half-bit: one half-period
+    if (em_halfCount < EM_MAX_HALFBUF)
+      em_halfBuf[em_halfCount++] = prev;
+  } else if (width >= EM_FULL_MIN_US && width < EM_FULL_MAX_US) {
+    // Full-bit: two identical half-periods
+    if (em_halfCount + 1 < EM_MAX_HALFBUF) {
+      em_halfBuf[em_halfCount++] = prev;
+      em_halfBuf[em_halfCount++] = prev;
+    }
+  } else {
+    // Unrecognised width — reset
+    em_halfCount = 0;
+    return;
+  }
+
+  // Need at least (EM_FRAME_BITS * 2) + 1 half-periods to try a decode
+  // (+1 for phase-offset search)
+  if (em_halfCount >= (uint8_t)(EM_FRAME_BITS * 2 + 1)) {
+    em_frameReady = true;
+  }
+}
+
+// Decode Manchester bits from half-period buffer at given start offset.
+// Returns number of decode errors (invalid pairs).
+static uint8_t manchesterDecode(const uint8_t *hp, uint8_t len,
+                                  uint8_t offset, uint8_t *bits, uint8_t nBits) {
+  uint8_t errors = 0;
+  for (uint8_t i = 0; i < nBits; i++) {
+    uint8_t idx = offset + i * 2;
+    if (idx + 1 >= len) { errors++; continue; }
+    uint8_t a = hp[idx], b = hp[idx + 1];
+    if      (a == 0 && b == 1) bits[i] = 1;
+    else if (a == 1 && b == 0) bits[i] = 0;
+    else                       { bits[i] = 0xFF; errors++; }
+  }
+  return errors;
+}
+
+// Validate and extract card ID from 64 decoded bits.
+// Returns true and fills hexOut (11 bytes incl. null) on success.
+static bool em4100Validate(const uint8_t *bits, char *hexOut) {
+  // Header: bits 0-8 must all be 1
+  for (uint8_t i = 0; i < EM_HEADER_BITS; i++)
+    if (bits[i] != 1) return false;
+
+  uint8_t cardBits[40];
+  uint8_t colAcc[4] = {0, 0, 0, 0};
+
+  for (uint8_t row = 0; row < 10; row++) {
+    uint8_t base = EM_HEADER_BITS + row * 5;
+    uint8_t d0 = bits[base], d1 = bits[base+1],
+            d2 = bits[base+2], d3 = bits[base+3],
+            rp = bits[base+4];
+    // Reject any error markers
+    if (d0 > 1 || d1 > 1 || d2 > 1 || d3 > 1 || rp > 1) return false;
+    // Row parity (even)
+    if (((d0 ^ d1 ^ d2 ^ d3) & 1) != rp) return false;
+    cardBits[row*4]   = d0;
+    cardBits[row*4+1] = d1;
+    cardBits[row*4+2] = d2;
+    cardBits[row*4+3] = d3;
+    colAcc[0] ^= d0; colAcc[1] ^= d1;
+    colAcc[2] ^= d2; colAcc[3] ^= d3;
+  }
+
+  // Column parity: bits 59-62
+  uint8_t cpBase = EM_HEADER_BITS + 50;
+  for (uint8_t c = 0; c < 4; c++)
+    if (bits[cpBase + c] != colAcc[c]) return false;
+
+  // Stop bit: bit 63 must be 0
+  if (bits[63] != 0) return false;
+
+  // Build hex string from 40 card bits (5 bytes)
+  uint32_t hi =  ((uint32_t)cardBits[0]  << 7) | ((uint32_t)cardBits[1]  << 6) |
+                 ((uint32_t)cardBits[2]  << 5) | ((uint32_t)cardBits[3]  << 4) |
+                 ((uint32_t)cardBits[4]  << 3) | ((uint32_t)cardBits[5]  << 2) |
+                 ((uint32_t)cardBits[6]  << 1) |  (uint32_t)cardBits[7];
+  uint32_t lo =  ((uint32_t)cardBits[8]  << 31)| ((uint32_t)cardBits[9]  << 30)|
+                 ((uint32_t)cardBits[10] << 29)| ((uint32_t)cardBits[11] << 28)|
+                 ((uint32_t)cardBits[12] << 27)| ((uint32_t)cardBits[13] << 26)|
+                 ((uint32_t)cardBits[14] << 25)| ((uint32_t)cardBits[15] << 24)|
+                 ((uint32_t)cardBits[16] << 23)| ((uint32_t)cardBits[17] << 22)|
+                 ((uint32_t)cardBits[18] << 21)| ((uint32_t)cardBits[19] << 20)|
+                 ((uint32_t)cardBits[20] << 19)| ((uint32_t)cardBits[21] << 18)|
+                 ((uint32_t)cardBits[22] << 17)| ((uint32_t)cardBits[23] << 16)|
+                 ((uint32_t)cardBits[24] << 15)| ((uint32_t)cardBits[25] << 14)|
+                 ((uint32_t)cardBits[26] << 13)| ((uint32_t)cardBits[27] << 12)|
+                 ((uint32_t)cardBits[28] << 11)| ((uint32_t)cardBits[29] << 10)|
+                 ((uint32_t)cardBits[30] << 9) | ((uint32_t)cardBits[31] << 8) |
+                 ((uint32_t)cardBits[32] << 7) | ((uint32_t)cardBits[33] << 6) |
+                 ((uint32_t)cardBits[34] << 5) | ((uint32_t)cardBits[35] << 4) |
+                 ((uint32_t)cardBits[36] << 3) | ((uint32_t)cardBits[37] << 2) |
+                 ((uint32_t)cardBits[38] << 1) |  (uint32_t)cardBits[39];
+  snprintf(hexOut, 11, "%02X%08X", (unsigned)hi, (unsigned)lo);
+  return true;
+}
+
+// Called from loop() — processes em_frameReady flag outside ISR context
+void em4100Process() {
+  if (!em_frameReady) return;
+
+  // Snapshot ISR buffer
+  uint8_t hp[EM_MAX_HALFBUF];
+  uint8_t hpLen;
+  noInterrupts();
+  hpLen = em_halfCount;
+  memcpy(hp, (const void*)em_halfBuf, hpLen);
+  em_halfCount  = 0;
+  em_frameReady = false;
+  interrupts();
+
+  if (hpLen < EM_FRAME_BITS * 2) return;
+
+  // Try both phase offsets (0 and 1) — offset 1 required per trace analysis
+  uint8_t bits[EM_FRAME_BITS];
+  char    hexOut[11];
+
+  for (uint8_t offset = 0; offset <= 1; offset++) {
+    uint8_t errs = manchesterDecode(hp, hpLen, offset, bits, EM_FRAME_BITS);
+    if (errs > 0) continue;
+    if (em4100Validate(bits, hexOut)) {
+      String newID = String(hexOut);
+      if (newID != last125ID) {
+        last125ID = newID;
+        DBG("[125k] Card: "); DBGLN(last125ID);
+      }
+      return;
+    }
+  }
+}
+
 // ── Training ──────────────────────────────────────────────────────────────────
 #define MAX_PROFILES 16
 #define NAME_LEN     20
@@ -59,22 +245,11 @@ struct CalData {
 
 // ── Tunable detection settings (loaded from NVS, editable via UI) ──────────────
 struct DetectSettings {
-  // Clear-channel trigger: event starts when liveC drops below
-  // (baseC * trigRatio). Range 0.5-0.99. Lower = needs bigger drop to trigger.
-  float  trigRatio;   // default 0.85  (C must drop to 85% of baseline)
-
-  // Minimum event duration in ms. Events shorter than this are noise.
+  float    trigRatio;   // default 0.85
   uint16_t minEventMs;  // default 20
-
-  // Maximum event duration in ms. Longer than this = object just sitting there.
   uint16_t maxEventMs;  // default 2000
-
-  // Nearest-neighbour match distance ceiling (0-441 in normalised RGB space).
-  // Higher = looser matching. Lower = stricter.
-  float matchDist;    // default 120.0
-
-  // EMA drift rate for baseline clear channel (0.01-0.2).
-  float emaAlpha;     // default 0.05
+  float    matchDist;   // default 120.0
+  float    emaAlpha;    // default 0.05
 };
 
 // ── All globals ─────────────────────────────────────────────────────────────────
@@ -91,30 +266,24 @@ String lastUID = "None";
 uint16_t liveR = 0, liveG = 0, liveB = 0, liveC = 0;
 uint8_t  normR = 0, normG = 0, normB = 0;
 
-// EMA baseline for clear channel (raw counts)
 float    baseC = 1000;
 
-// Last committed detection
 uint8_t  detR = 0, detG = 0, detB = 0;
 String   detName   = "—";
 float    detDist   = 0;
-float    detConf   = 0;   // 0-100 confidence
+float    detConf   = 0;
 bool     detMatch  = false;
-uint32_t detEventMs = 0;  // duration of last event (debug)
+uint32_t detEventMs = 0;
 
-// Event state machine
 enum EventState { IDLE, ACTIVE, SETTLING };
 EventState evState     = IDLE;
 uint32_t   evStartMs   = 0;
 uint32_t   evEndMs     = 0;
-// Running accumulator for averaging during event
 float      accumR = 0, accumG = 0, accumB = 0;
 uint16_t   accumN = 0;
-// Sample ring buffer (for debug / future use)
 uint8_t    sampR[SAMP_BUF], sampG[SAMP_BUF], sampB[SAMP_BUF];
 uint8_t    sampHead = 0;
 
-// Last event stats for /livedata debug
 float    lastEventDur = 0;
 float    lastAvgR = 0, lastAvgG = 0, lastAvgB = 0;
 
@@ -255,30 +424,30 @@ void handleData() {
   snprintf(hex, sizeof(hex), "#%02X%02X%02X", detR, detG, detB);
   String j = "{\"r\":" + String(detR) + ",\"g\":" + String(detG) + ",\"b\":" + String(detB) +
     ",\"hex\":\"" + hex + "\",\"name\":\"" + detName + "\"" +
-    ",\"dist\":" + String(detDist, 1) +
-    ",\"conf\":" + String(detConf, 1) +
-    ",\"match\":" + (detMatch ? "true" : "false") +
-    ",\"uid\":\"" + lastUID + "\"" +
-    ",\"calOK\":" + (cal.valid ? "true" : "false") +
-    ",\"event\":" + (evState != IDLE ? "true" : "false") +
-    ",\"evDur\":" + String(detEventMs) + "}";
+    ",\"dist\":"  + String(detDist, 1) +
+    ",\"conf\":"  + String(detConf, 1) +
+    ",\"match\":"  + (detMatch ? "true" : "false") +
+    ",\"uid\":\""  + lastUID   + "\"" +
+    ",\"id125\":\"" + last125ID + "\"" +
+    ",\"calOK\":"  + (cal.valid ? "true" : "false") +
+    ",\"event\":"  + (evState != IDLE ? "true" : "false") +
+    ",\"evDur\":"  + String(detEventMs) + "}";
   server.send(200, "application/json", j);
 }
 
 void handleLiveData() {
   char hex[8];
   snprintf(hex, sizeof(hex), "#%02X%02X%02X", normR, normG, normB);
-  // clear channel ratio vs baseline
   float cRatio = baseC > 0 ? (float)liveC / baseC : 1.0f;
   String j = "{\"lr\":" + String(liveR) + ",\"lg\":" + String(liveG) +
     ",\"lb\":" + String(liveB) + ",\"lc\":" + String(liveC) +
     ",\"nr\":" + String(normR) + ",\"ng\":" + String(normG) + ",\"nb\":" + String(normB) +
     ",\"hex\":\"" + hex + "\"" +
-    ",\"baseC\":" + String((int)baseC) +
-    ",\"cRatio\":" + String(cRatio, 3) +
+    ",\"baseC\":"    + String((int)baseC) +
+    ",\"cRatio\":"   + String(cRatio, 3) +
     ",\"trigRatio\":" + String(ds.trigRatio, 3) +
-    ",\"event\":" + (evState != IDLE ? "true" : "false") +
-    ",\"avgR\":" + String((int)lastAvgR) + ",\"avgG\":" + String((int)lastAvgG) + ",\"avgB\":" + String((int)lastAvgB) +
+    ",\"event\":"    + (evState != IDLE ? "true" : "false") +
+    ",\"avgR\":"  + String((int)lastAvgR) + ",\"avgG\":" + String((int)lastAvgG) + ",\"avgB\":" + String((int)lastAvgB) +
     ",\"lastDur\":" + String((int)lastEventDur) + "}";
   server.send(200, "application/json", j);
 }
@@ -324,7 +493,7 @@ void handleProfileDelete() {
 }
 
 void handleGetSettings() {
-  String j = "{\"trigRatio\":" + String(ds.trigRatio, 3) +
+  String j = "{\"trigRatio\":"  + String(ds.trigRatio, 3) +
     ",\"minEventMs\":" + String(ds.minEventMs) +
     ",\"maxEventMs\":" + String(ds.maxEventMs) +
     ",\"matchDist\":"  + String(ds.matchDist, 1) +
@@ -361,7 +530,7 @@ void handleCalBlack() {
 void handleCalWhite() {
   cal.wR = liveR; cal.wG = liveG; cal.wB = liveB; cal.valid = true; saveCal();
   updateNorm();
-  baseC = liveC;   // seed clear baseline from white cal
+  baseC = liveC;
   DBG("Cal white R="); DBG(cal.wR); DBG(" G="); DBG(cal.wG); DBG(" B="); DBGLN(cal.wB);
   DBG("  baseC="); DBGLN(baseC);
   server.send(200, "application/json", "{\"ok\":true}");
@@ -421,17 +590,18 @@ void setup() {
   tcsOK = tcs.begin();
   loadCal(); loadProfiles(); loadSettings();
 
-  // seed baseC: if white cal exists use that C value, else use a live reading
-  if (cal.valid) {
-    // will be updated properly on first white cal; seed generously
-    baseC = 2000;
-  }
+  if (cal.valid) baseC = 2000;
   DBGLN(tcsOK ? "TCS3472 ready (2.4ms/16x)" : "TCS3472 NOT found");
   DBG("Settings: trigRatio="); DBG(ds.trigRatio);
   DBG(" minMs="); DBG(ds.minEventMs);
   DBG(" maxMs="); DBG(ds.maxEventMs);
   DBG(" matchDist="); DBG(ds.matchDist);
   DBG(" ema="); DBGLN(ds.emaAlpha);
+
+  // EM4100 125kHz decoder — GPIO 0, interrupt on every edge
+  pinMode(EM4100_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(EM4100_PIN), em4100_isr, CHANGE);
+  DBGLN("EM4100 decoder ready → GPIO 0");
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
@@ -449,7 +619,10 @@ void loop() {
   if (apMode) dns.processNextRequest(); else ArduinoOTA.handle();
   server.handleClient();
 
-  // RFID
+  // EM4100 125kHz Manchester decode
+  em4100Process();
+
+  // MFRC522 13.56MHz RFID
   {
     static bool tagPresent = false;
     byte buf[2]; byte bsz = sizeof(buf);
@@ -478,13 +651,10 @@ void loop() {
     switch (evState) {
 
       case IDLE: {
-        // Drift baseC slowly toward current clear value
         baseC += ds.emaAlpha * ((float)liveC - baseC);
-
-        // Trigger when clear drops significantly below baseline
         float trigThresh = baseC * ds.trigRatio;
         if ((float)liveC < trigThresh && baseC > 50) {
-          evState  = ACTIVE;
+          evState   = ACTIVE;
           evStartMs = millis();
           accumR = accumG = accumB = 0;
           accumN = 0; sampHead = 0;
@@ -496,29 +666,15 @@ void loop() {
 
       case ACTIVE: {
         uint32_t dur = millis() - evStartMs;
-
-        // Accumulate normalised samples for averaging
         accumR += normR; accumG += normG; accumB += normB; accumN++;
-        // Also store in ring buffer (wraps if very long event)
         uint8_t si = sampHead % SAMP_BUF;
         sampR[si] = normR; sampG[si] = normG; sampB[si] = normB; sampHead++;
-
-        // Check for event end: clear channel recovered above trigger threshold
         float trigThresh = baseC * ds.trigRatio;
         bool cleared = (float)liveC >= trigThresh;
-
-        if (cleared) {
-          evEndMs = millis();
-          evState = SETTLING;
-          DBG("[EVT] settling dur="); DBGLN(dur);
-        }
-
-        // Abort if exceeds maxEventMs (object sitting on sensor)
+        if (cleared) { evEndMs = millis(); evState = SETTLING; DBG("[EVT] settling dur="); DBGLN(dur); }
         if (dur > ds.maxEventMs) {
-          evState = IDLE;
-          accumN  = 0;
+          evState = IDLE; accumN = 0;
           DBG("[EVT] aborted (too long) dur="); DBGLN(dur);
-          // resume baseline drift immediately
           baseC = liveC;
         }
         break;
@@ -527,24 +683,16 @@ void loop() {
       case SETTLING: {
         uint32_t dur = evEndMs - evStartMs;
         lastEventDur = dur;
-
-        // Discard events shorter than minEventMs (noise/glint)
         if (dur < ds.minEventMs || accumN == 0) {
           DBG("[EVT] discarded noise dur="); DBGLN(dur);
-          evState = IDLE;
-          baseC = liveC;
-          break;
+          evState = IDLE; baseC = liveC; break;
         }
-
-        // Compute average normalised color over entire event
         uint8_t avgR = (uint8_t)(accumR / accumN);
         uint8_t avgG = (uint8_t)(accumG / accumN);
         uint8_t avgB = (uint8_t)(accumB / accumN);
         lastAvgR = avgR; lastAvgG = avgG; lastAvgB = avgB;
-
         detR = avgR; detG = avgG; detB = avgB;
         detEventMs = dur;
-
         int match = matchProfile(avgR, avgG, avgB);
         if (match >= 0) {
           detName  = String(profiles[match].name);
@@ -553,17 +701,13 @@ void loop() {
           detMatch = true;
           DBG("[EVT] MATCH="); DBG(detName); DBG(" dist="); DBG(detDist); DBG(" conf="); DBG(detConf); DBG("%");
         } else {
-          detName  = "Unknown";
-          detDist  = ds.matchDist;
-          detConf  = 0;
-          detMatch = false;
+          detName  = "Unknown"; detDist = ds.matchDist; detConf = 0; detMatch = false;
           DBG("[EVT] no match");
         }
         DBG(" avgRGB="); DBG(avgR); DBG("/"); DBG(avgG); DBG("/"); DBG(avgB);
         DBG(" dur="); DBG(dur); DBG("ms samples="); DBGLN(accumN);
-
         evState = IDLE;
-        baseC   = liveC;  // reset baseline to current clear after event
+        baseC   = liveC;
         break;
       }
     }
