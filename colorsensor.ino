@@ -75,26 +75,27 @@ struct DetectSettings {
 // Oscope-confirmed timing for this RDM630 unit:
 //   Half-bit periods cluster tightly at 200-300 us
 //   Full-bit periods cluster tightly at 450-540 us
-//   Clean gap between 350-450 us with essentially no real pulses there.
+//   Dead zone 350-450 us: no real pulses, occasional ISR jitter lands here.
 //
-// ISR jitter from WiFi/SPI interrupts on ESP32-C3 can delay edge detection
-// by 50-100 us, stretching a real 250us half-period up to ~350us or a real
-// 500us full-period down to ~420us. These land in the dead zone.
-// FIX: dead-zone and out-of-range pulses are silently skipped (return without
-// resetting em_halfCount) so a single jittered edge does not destroy the buffer.
+// Polarity: DEMOD_OUT idles HIGH, goes LOW during transmission.
+//   prev = level (not level^1) gives correct Manchester sense.
+//
+// Jitter tolerance: Manchester errors from jitter-stretched pulses are
+//   tolerated by removing the early-exit 'errs > 0' gate. Corrupt bits
+//   become 0xFF and are caught by em4100Validate's 'if (d > 1) return false'
+//   check. Clean frames pass parity normally; frames with too many errors
+//   still fail validate cleanly. Confirmed working via standalone debug sketch.
 
 #define EM4100_PIN       0
-#define EM_HALF_MIN_US   120   // well below real minimum (~200us)
-#define EM_HALF_MAX_US   350   // half-period window top
-// 350-450 us = dead zone: pulse is silently skipped, buffer preserved
-#define EM_FULL_MIN_US   450   // full-period window bottom
-#define EM_FULL_MAX_US   700   // well above real maximum (~540us)
-#define EM_IDLE_US       1500  // genuine inter-frame gap: reset buffer
+#define EM_HALF_MIN_US   120
+#define EM_HALF_MAX_US   350
+// 350-450 us dead zone: skip silently, buffer preserved
+#define EM_FULL_MIN_US   450
+#define EM_FULL_MAX_US   700
+#define EM_IDLE_US       1500
 #define EM_FRAME_BITS    64
 #define EM_HEADER_BITS   9
-// Buffer holds ~2.5 frames so sliding-window search always finds a clean frame
 #define EM_MAX_HALFBUF   352
-// Only flag frameReady after 2 full frames worth so decode has margin
 #define EM_READY_THRESH  (EM_FRAME_BITS * 4)
 
 volatile uint32_t em_lastEdge   = 0;
@@ -111,27 +112,23 @@ void IRAM_ATTR em4100_isr() {
   uint32_t width = now - em_lastEdge;
   em_lastEdge    = now;
 
-  // True inter-frame idle: reset accumulator and start fresh
   if (width > EM_IDLE_US) { em_halfCount = 0; return; }
   if (em_frameReady) return;
 
+  // Correct polarity: store the level that was present BEFORE this edge
   uint8_t level = (uint8_t)digitalRead(EM4100_PIN);
-  uint8_t prev  = level ^ 1;
+  uint8_t prev  = level;  // NOTE: not level^1 - confirmed correct by debug sketch
 
   if (width >= EM_HALF_MIN_US && width <= EM_HALF_MAX_US) {
-    // Half-bit period: one half-period sample
     if (em_halfCount < EM_MAX_HALFBUF)
       em_halfBuf[em_halfCount++] = prev;
   } else if (width >= EM_FULL_MIN_US && width <= EM_FULL_MAX_US) {
-    // Full-bit period: two identical half-period samples
     if (em_halfCount + 1 < EM_MAX_HALFBUF) {
       em_halfBuf[em_halfCount++] = prev;
       em_halfBuf[em_halfCount++] = prev;
     }
   }
-  // Dead zone (350-450 us) or any other out-of-range width:
-  // silently skip this pulse, preserve the buffer.
-  // Caused by ISR latency jitter stretching/compressing a real pulse.
+  // Dead zone or out-of-range: skip silently, preserve buffer
 
   if (em_halfCount >= EM_READY_THRESH)
     em_frameReady = true;
@@ -152,6 +149,7 @@ static uint8_t manchesterDecode(const uint8_t *hp, uint16_t len,
 }
 
 static bool em4100Validate(const uint8_t *bits, char *hexOut) {
+  // Header: 9 ones
   for (uint8_t i = 0; i < EM_HEADER_BITS; i++)
     if (bits[i] != 1) return false;
 
@@ -163,6 +161,7 @@ static bool em4100Validate(const uint8_t *bits, char *hexOut) {
     uint8_t d0 = bits[base], d1 = bits[base+1],
             d2 = bits[base+2], d3 = bits[base+3],
             rp = bits[base+4];
+    // 0xFF from Manchester errors will fail this check
     if (d0 > 1 || d1 > 1 || d2 > 1 || d3 > 1 || rp > 1) return false;
     if (((d0 ^ d1 ^ d2 ^ d3) & 1) != rp) return false;
     cardBits[row*4]   = d0; cardBits[row*4+1] = d1;
@@ -187,7 +186,6 @@ static bool em4100Validate(const uint8_t *bits, char *hexOut) {
 void em4100Process() {
   if (!em_frameReady) return;
 
-  // Snapshot ISR buffer atomically
   uint8_t  hp[EM_MAX_HALFBUF];
   uint16_t hpLen;
   noInterrupts();
@@ -202,30 +200,20 @@ void em4100Process() {
   uint8_t bits[EM_FRAME_BITS];
   char    hexOut[11];
 
-  // Slide across every even offset in the buffer.
-  // Even offsets only: Manchester pairs are always 2 half-periods wide.
   uint16_t maxOffset = hpLen - (uint16_t)(EM_FRAME_BITS * 2);
   for (uint16_t offset = 0; offset <= maxOffset; offset += 2) {
-    uint8_t errs = manchesterDecode(hp, hpLen, offset, bits, EM_FRAME_BITS);
-    if (errs > 0) continue;
+    // Decode regardless of Manchester error count:
+    // validate() will reject corrupt bits (0xFF) via the >1 check
+    manchesterDecode(hp, hpLen, offset, bits, EM_FRAME_BITS);
     if (em4100Validate(bits, hexOut)) {
       String newID = String(hexOut);
       if (newID != last125ID) {
         last125ID = newID;
-        DBG("[125k] Card: "); DBG(last125ID);
-        DBG(" (offset="); DBG(offset); DBG(" hpLen="); DBG(hpLen); DBGLN(")");
+        DBG("[125k] Card: "); DBGLN(last125ID);
       }
       return;
     }
   }
-
-  // All offsets failed: dump diagnostics
-  DBG("[125k] validate failed hpLen="); DBG(hpLen);
-  DBG(" offsets_tried="); DBGLN(maxOffset / 2 + 1);
-  manchesterDecode(hp, hpLen, 0, bits, 16);
-  DBG("  hdr[0..8]=");
-  for (uint8_t i = 0; i < 9; i++) { DBG(bits[i] == 0xFF ? 'X' : (char)('0' + bits[i])); }
-  DBGLN();
 }
 
 // ── All globals ─────────────────────────────────────────────────────────────────
