@@ -19,6 +19,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .lbl{color:#888;font-size:.8em}
   .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#555;margin-right:6px}
   .dot.ok{background:#4caf50}
+  .calbtn{flex:1;padding:9px;background:#2a2a2a;color:#eee;border:1px solid #555;border-radius:5px;cursor:pointer;font-size:.85em;line-height:1.4}
+  .calbtn:hover{background:#383838}
+  .calbtn.rst{color:#888;border-color:#444}
 </style>
 </head><body>
 <h1>🎨 Color Sensor Node</h1>
@@ -39,6 +42,16 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <div class="uid" id="uid">—</div>
 </div>
 
+<div class="card">
+  <div class="lbl">Calibration &nbsp;<span id="calst" style="color:#f44336">uncalibrated</span></div>
+  <div style="display:flex;gap:8px;margin-top:10px">
+    <button class="calbtn" onclick="doCalStep('black')">⬛ Set Black<br><small>Cover sensor</small></button>
+    <button class="calbtn" onclick="doCalStep('white')">⬜ Set White<br><small>Point at white paper</small></button>
+    <button class="calbtn rst" onclick="doCalStep('reset')">↺ Reset</button>
+  </div>
+  <div id="calmsg" style="font-size:.8em;color:#aaa;margin-top:8px;min-height:1.2em"></div>
+</div>
+
 <div style="text-align:right;font-size:.75em;color:#555">
   <span class="dot" id="dot"></span><span id="ts">—</span>
 </div>
@@ -55,8 +68,22 @@ function update(){
     document.getElementById('sw').style.background = d.hex;
     document.getElementById('dot').className   = 'dot ok';
     document.getElementById('ts').textContent  = new Date().toLocaleTimeString();
+    var cs = document.getElementById('calst');
+    if(d.calOK){ cs.textContent='✓ calibrated'; cs.style.color='#4caf50'; }
+    else        { cs.textContent='uncalibrated'; cs.style.color='#f44336'; }
   }).catch(()=>{ document.getElementById('dot').className='dot'; });
 }
+
+function doCalStep(type){
+  fetch('/cal/'+type,{method:'POST'}).then(r=>r.json()).then(()=>{
+    var msg = document.getElementById('calmsg');
+    if(type==='black') msg.textContent='Black saved — now point at white paper and tap Set White.';
+    else if(type==='white') msg.textContent='White saved — calibration active!';
+    else msg.textContent='Calibration cleared.';
+    update();
+  }).catch(()=>{ document.getElementById('calmsg').textContent='Error — try again.'; });
+}
+
 update();
 setInterval(update, 1000);
 </script>
